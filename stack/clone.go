@@ -5,6 +5,7 @@ package stack
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -27,12 +28,13 @@ const (
 
 // Clone will clone the stack at srcdir into destdir.
 //
-// - srcdir must be a stack (fail otherwise)
+// - srcdir must contain at least one stack directly, or in subdirs unless skipChildStacks is set (fail otherwise)
 // - destdir must not exist (fail otherwise)
+// - if skipChildStacks is true, child stacks are ignored
 // - All files and directories are copied  (except dotfiles/dirs)
 // - If cloned stack has an ID it will be adjusted to a generated UUID.
 // - If cloned stack has no ID the cloned stack also won't have an ID.
-func Clone(root *config.Root, destdir, srcdir string) error {
+func Clone(root *config.Root, destdir, srcdir string, skipChildStacks bool) (int, error) {
 	rootdir := root.HostDir()
 
 	logger := log.With().
@@ -40,63 +42,114 @@ func Clone(root *config.Root, destdir, srcdir string) error {
 		Str("rootdir", rootdir).
 		Str("destdir", destdir).
 		Str("srcdir", srcdir).
+		Bool("skipChildStacks", skipChildStacks).
 		Logger()
 
-	logger.Trace().Msg("cloning stack, checking invariants")
-
 	if !strings.HasPrefix(srcdir, rootdir) {
-		return errors.E(ErrInvalidStackDir, "src dir %q must be inside project root %q", srcdir, rootdir)
+		return 0, errors.E(ErrInvalidStackDir, "src dir %q must be inside project root %q", srcdir, rootdir)
 	}
 
 	if !strings.HasPrefix(destdir, rootdir) {
-		return errors.E(ErrInvalidStackDir, "dest dir %q must be inside project root %q", destdir, rootdir)
+		return 0, errors.E(ErrInvalidStackDir, "dest dir %q must be inside project root %q", destdir, rootdir)
 	}
 
 	if _, err := os.Stat(destdir); err == nil {
-		return errors.E(ErrCloneDestDirExists, destdir)
+		return 0, errors.E(ErrCloneDestDirExists, destdir)
 	}
 
-	srcStack, err := config.LoadStack(root, project.PrjAbsPath(root.HostDir(), srcdir))
-	if err != nil {
-		return errors.E(ErrInvalidStackDir, err, "src dir %q must be a valid stack", srcdir)
+	needsCleanup := true
+	defer func() {
+		if !needsCleanup {
+			return
+		}
+
+		if err := os.RemoveAll(destdir); err != nil {
+			logger.Debug().Err(err).Msg("failed to cleanup destdir after error")
+		}
+	}()
+
+	srcpath := project.PrjAbsPath(rootdir, srcdir)
+
+	// Get all stacks in srcpath (including children)
+	tree, found := root.Lookup(srcpath)
+	if !found {
+		return 0, errors.E(ErrInvalidStackDir, "src dir %q must contain valid stacks", srcdir)
 	}
 
-	logger.Trace().Msg("copying stack files")
-
-	if err := fs.CopyDir(destdir, srcdir, filterDotFiles); err != nil {
-		return err
+	stackTrees := tree.Stacks()
+	if len(stackTrees) == 0 {
+		return 0, errors.E(ErrInvalidStackDir, "src dir %q must contain valid stacks", srcdir)
 	}
 
-	if srcStack.ID == "" {
-		logger.Trace().Msg("stack has no ID, nothing else to do")
-		return nil
+	type cloneTask struct {
+		Srcdir         string
+		Destdir        string
+		ShouldUpdateID bool
+	}
+	tasks := []cloneTask{}
+
+	// Use this set to identify stack root dirs and don't recurse into them when copying
+	stackset := map[string]struct{}{}
+
+	for _, e := range stackTrees {
+		stackSrcdir := e.HostDir()
+		rel, _ := filepath.Rel(srcdir, stackSrcdir)
+
+		stackDestdir := filepath.Join(destdir, rel)
+
+		// If destdir is within srcdir, we could encounter a stackDestdir in the source dir
+		// created by a previous cloneTask. They must be ignored, too.
+		stackset[stackSrcdir] = struct{}{}
+		stackset[stackDestdir] = struct{}{}
+
+		if skipChildStacks && rel != "." {
+			continue
+		}
+
+		tasks = append(tasks, cloneTask{
+			Srcdir:         stackSrcdir,
+			Destdir:        stackDestdir,
+			ShouldUpdateID: e.Node.Stack.ID != "",
+		})
 	}
 
-	logger.Trace().Msg("stack has ID, updating ID of the cloned stack")
-	_, err = UpdateStackID(destdir)
-	if err != nil {
-		return err
+	if len(tasks) == 0 {
+		return 0, errors.E(ErrInvalidStackDir, "no stacks to clone in %q", srcdir)
 	}
 
-	return root.LoadSubTree(project.PrjAbsPath(rootdir, destdir))
-}
+	for _, st := range tasks {
+		filter := func(dir string, entry os.DirEntry) bool {
+			if strings.HasPrefix(entry.Name(), ".") {
+				return false
+			}
 
-func filterDotFiles(_ string, entry os.DirEntry) bool {
-	return !strings.HasPrefix(entry.Name(), ".")
+			abspath := filepath.Join(dir, entry.Name())
+			_, found := stackset[abspath]
+			return !found
+		}
+
+		if err := fs.CopyDir(st.Destdir, st.Srcdir, filter); err != nil {
+			return 0, err
+		}
+
+		if !st.ShouldUpdateID {
+			continue
+		}
+
+		if _, err := UpdateStackID(root, st.Destdir); err != nil {
+			return 0, err
+		}
+	}
+
+	needsCleanup = false
+	return len(tasks), root.LoadSubTree(project.PrjAbsPath(rootdir, destdir))
 }
 
 // UpdateStackID updates the stack.id of the given stack directory.
 // The functions updates just the file which defines the stack block.
 // The updated file will lose all comments.
-func UpdateStackID(stackdir string) (string, error) {
-	logger := log.With().
-		Str("action", "stack.updateStackID()").
-		Str("stack", stackdir).
-		Logger()
-
-	logger.Trace().Msg("parsing stack")
-
-	parser, err := hcl.NewTerramateParser(stackdir, stackdir)
+func UpdateStackID(root *config.Root, stackdir string) (string, error) {
+	parser, err := hcl.NewTerramateParser(root.HostDir(), stackdir)
 	if err != nil {
 		return "", err
 	}
@@ -108,8 +161,6 @@ func UpdateStackID(stackdir string) (string, error) {
 	if err := parser.Parse(); err != nil {
 		return "", err
 	}
-
-	logger.Trace().Msg("finding file containing stack definition")
 
 	stackFilePath := getStackFilepath(parser)
 	if stackFilePath == "" {
@@ -127,14 +178,10 @@ func UpdateStackID(stackdir string) (string, error) {
 	// has no comments on it, so building a new HCL file from the parsed
 	// AST will lose all comments from the original code.
 
-	logger.Trace().Msg("reading stack file")
-
 	stackContents, err := os.ReadFile(stackFilePath)
 	if err != nil {
 		return "", errors.E(err, "reading stack definition file")
 	}
-
-	logger.Trace().Msg("parsing stack file")
 
 	parsed, diags := hclwrite.ParseConfig([]byte(stackContents), stackFilePath, hhcl.InitialPos)
 	if diags.HasErrors() {
@@ -142,8 +189,6 @@ func UpdateStackID(stackdir string) (string, error) {
 	}
 
 	blocks := parsed.Body().Blocks()
-
-	logger.Trace().Msg("searching for stack ID attribute")
 
 	for _, block := range blocks {
 		if block.Type() != hcl.StackBlockType {
@@ -159,8 +204,6 @@ func UpdateStackID(stackdir string) (string, error) {
 
 		body := block.Body()
 		body.SetAttributeValue("id", cty.StringVal(id))
-
-		logger.Trace().Msg("saving updated file")
 
 		err = os.WriteFile(stackFilePath, parsed.Bytes(), originalFileMode)
 		if err != nil {

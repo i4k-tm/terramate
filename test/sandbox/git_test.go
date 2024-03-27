@@ -11,19 +11,17 @@ import (
 	"github.com/terramate-io/terramate/test/sandbox"
 )
 
-func init() {
-	zerolog.SetGlobalLevel(zerolog.Disabled)
-}
-
 func TestInitializedGitHasOriginMain(t *testing.T) {
-	basedir := t.TempDir()
+	t.Parallel()
+	basedir := test.TempDir(t)
 	git := sandbox.NewGit(t, basedir)
 	git.Init()
 	git.RevParse("origin/main")
 }
 
 func TestInitializeArbitraryRemote(t *testing.T) {
-	basedir := t.TempDir()
+	t.Parallel()
+	basedir := test.TempDir(t)
 	git := sandbox.NewGit(t, basedir)
 	git.InitLocalRepo()
 
@@ -37,4 +35,8 @@ func TestInitializeArbitraryRemote(t *testing.T) {
 
 	git.SetupRemote(remote, remoteBranch, "main")
 	git.RevParse(remote + "/" + remoteBranch)
+}
+
+func init() {
+	zerolog.SetGlobalLevel(zerolog.Disabled)
 }

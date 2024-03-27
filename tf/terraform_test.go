@@ -19,6 +19,7 @@ import (
 )
 
 func TestHCLParserModules(t *testing.T) {
+	t.Parallel()
 	type (
 		want struct {
 			modules []tf.Module
@@ -195,8 +196,10 @@ module "test" {
 			},
 		},
 	} {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			configdir := t.TempDir()
+			t.Parallel()
+			configdir := test.TempDir(t)
 			tfpath := test.WriteFile(t, configdir, tc.input.filename, tc.input.body)
 			fixupFiledirOnErrorsFileRanges(configdir, tc.want.errs)
 
@@ -350,7 +353,7 @@ func TestTerraformHasBackend(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			s := sandbox.New(t)
+			s := sandbox.NoGit(t, false)
 			s.BuildTree(tc.layout)
 
 			path := filepath.Join(s.RootDir(), filename)

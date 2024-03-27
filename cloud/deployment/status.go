@@ -42,9 +42,16 @@ func NewStatus(str string) (Status, error) {
 func (s Status) Validate() error {
 	// each status has only 1 bit set.
 	if nbits := bits.OnesCount8(uint8(s)); nbits != 1 || s > lastStatus {
-		return errors.E(ErrInvalidStatus)
+		return errors.E(ErrInvalidStatus, "%s", s)
 	}
 	return nil
+}
+
+// IsFinalState tells if the status is a final deployment state.
+// The deployment state is a finite state machine where final states can be only
+// OK, Failed or Canceled.
+func (s Status) IsFinalState() bool {
+	return s == OK || s == Failed || s == Canceled
 }
 
 // MarshalJSON implements the Marshaller interface.

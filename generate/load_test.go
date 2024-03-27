@@ -23,6 +23,7 @@ import (
 )
 
 func TestLoad(t *testing.T) {
+	t.Parallel()
 	type (
 		file struct {
 			path string
@@ -46,7 +47,6 @@ func TestLoad(t *testing.T) {
 			wantErr error
 		}
 	)
-	t.Parallel()
 
 	tcases := []testcase{
 		{
@@ -537,7 +537,8 @@ func TestLoad(t *testing.T) {
 	for _, tc := range tcases {
 		tcase := tc
 		t.Run(tcase.name, func(t *testing.T) {
-			s := sandbox.New(t)
+			t.Parallel()
+			s := sandbox.NoGit(t, true)
 			s.BuildTree(tcase.layout)
 			root := s.RootEntry()
 			for _, cfg := range tcase.configs {

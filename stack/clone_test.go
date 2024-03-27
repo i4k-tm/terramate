@@ -11,12 +11,15 @@ import (
 
 	"github.com/madlambda/spells/assert"
 	"github.com/terramate-io/terramate/errors"
+	"github.com/terramate-io/terramate/hcl"
 	"github.com/terramate-io/terramate/stack"
 	"github.com/terramate-io/terramate/test"
+	. "github.com/terramate-io/terramate/test/hclwrite/hclutils"
 	"github.com/terramate-io/terramate/test/sandbox"
 )
 
 func TestStackClone(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name    string
 		layout  []string
@@ -56,6 +59,59 @@ func TestStackClone(t *testing.T) {
 			dest: "/dir/subdir/cloned-stack",
 		},
 		{
+			name: "clone stack with import",
+			layout: []string{
+				"s:/stack",
+				"f:/stack/imports.tm:" + Block("import",
+					Str("source", "/modules/common.tm")).String(),
+				"f:/modules/common.tm:" + Globals(
+					Str("hello", "world"),
+				).String(),
+			},
+			src:  "/stack",
+			dest: "/cloned-stack",
+		},
+		{
+			name: "clone stack with wildcard import",
+			layout: []string{
+				"s:/stack",
+				"f:/stack/imports.tm:" + Block("import",
+					Str("source", "/modules/*.tm")).String(),
+				"f:/modules/common.tm:" + Globals(
+					Str("hello", "world"),
+				).String(),
+			},
+			src:  "/stack",
+			dest: "/cloned-stack",
+		},
+		{
+			name: "clone stack with relative import inside src stack",
+			layout: []string{
+				"s:/stack-a",
+				"f:/stack-a/imports.tm:" + Block("import",
+					Str("source", "module-a-imports/a.tm")).String(),
+				"f:/stack-a/module-a-imports/a.tm:" + Globals(
+					Str("hello", "world"),
+				).String(),
+			},
+			src:  "/stack-a",
+			dest: "/cloned-stack",
+		},
+		{
+			name: "clone stack with relative import outside scope of cloned stack",
+			layout: []string{
+				"s:/dir/stack-a",
+				"f:/dir/stack-a/imports.tm:" + Block("import",
+					Str("source", "../common/a.tm")).String(),
+				"f:/dir/common/a.tm:" + Globals(
+					Str("hello", "world"),
+				).String(),
+			},
+			src:     "/dir/stack-a",
+			dest:    "/cloned-stack",
+			wantErr: errors.E(hcl.ErrImport),
+		},
+		{
 			name:    "src dir must be stack",
 			layout:  []string{"d:/not-stack"},
 			src:     "/not-stack",
@@ -81,13 +137,15 @@ func TestStackClone(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			s := sandbox.New(t)
+			t.Parallel()
+			s := sandbox.NoGit(t, true)
 			s.BuildTree(tc.layout)
 
 			srcdir := filepath.Join(s.RootDir(), tc.src)
 			destdir := filepath.Join(s.RootDir(), tc.dest)
-			err := stack.Clone(s.Config(), destdir, srcdir)
+			_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 			assert.IsError(t, err, tc.wantErr)
 
 			if tc.wantErr != nil {
@@ -100,23 +158,26 @@ func TestStackClone(t *testing.T) {
 }
 
 func TestStackCloneSrcDirMustBeInsideRootdir(t *testing.T) {
-	s := sandbox.New(t)
-	srcdir := t.TempDir()
+	t.Parallel()
+	s := sandbox.NoGit(t, true)
+	srcdir := test.TempDir(t)
 	destdir := filepath.Join(s.RootDir(), "new-stack")
-	err := stack.Clone(s.Config(), destdir, srcdir)
+	_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 	assert.IsError(t, err, errors.E(stack.ErrInvalidStackDir))
 }
 
 func TestStackCloneTargetDirMustBeInsideRootdir(t *testing.T) {
-	s := sandbox.New(t)
+	t.Parallel()
+	s := sandbox.NoGit(t, true)
 	srcdir := filepath.Join(s.RootDir(), "src-stack")
-	destdir := t.TempDir()
-	err := stack.Clone(s.Config(), destdir, srcdir)
+	destdir := test.TempDir(t)
+	_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 	assert.IsError(t, err, errors.E(stack.ErrInvalidStackDir))
 }
 
 func TestStackCloneIgnoresDotDirsAndFiles(t *testing.T) {
-	s := sandbox.New(t)
+	t.Parallel()
+	s := sandbox.NoGit(t, true)
 	s.BuildTree([]string{
 		"s:stack",
 		"f:stack/.dotfile",
@@ -124,7 +185,7 @@ func TestStackCloneIgnoresDotDirsAndFiles(t *testing.T) {
 	})
 	srcdir := filepath.Join(s.RootDir(), "stack")
 	destdir := filepath.Join(s.RootDir(), "cloned-stack")
-	err := stack.Clone(s.Config(), destdir, srcdir)
+	_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 	assert.NoError(t, err)
 
 	entries := test.ReadDir(t, destdir)
@@ -133,6 +194,7 @@ func TestStackCloneIgnoresDotDirsAndFiles(t *testing.T) {
 }
 
 func TestStackCloneIfStackHasIDClonedStackHasNewUUID(t *testing.T) {
+	t.Parallel()
 	const (
 		stackID          = "stack-id"
 		stackName        = "stack name"
@@ -171,7 +233,7 @@ generate_hcl "test2.hcl" {
 }
 `
 	)
-	s := sandbox.New(t)
+	s := sandbox.NoGit(t, true)
 	s.BuildTree([]string{"d:stack"})
 
 	stackEntry := s.DirEntry("stack")
@@ -181,7 +243,7 @@ generate_hcl "test2.hcl" {
 	srcdir := filepath.Join(s.RootDir(), "stack")
 	destdir := filepath.Join(s.RootDir(), "cloned-stack")
 
-	err := stack.Clone(s.Config(), destdir, srcdir)
+	_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 	assert.NoError(t, err)
 
 	cfg := test.ParseTerramateConfig(t, destdir)
@@ -209,6 +271,7 @@ generate_hcl "test2.hcl" {
 }
 
 func TestStackClonesTags(t *testing.T) {
+	t.Parallel()
 	const (
 		stackName        = "stack name"
 		stackDesc        = "stack description"
@@ -224,7 +287,7 @@ stack {
 }
 `
 	)
-	s := sandbox.New(t)
+	s := sandbox.NoGit(t, true)
 	s.BuildTree([]string{"d:stack"})
 
 	stackEntry := s.DirEntry("stack")
@@ -234,7 +297,7 @@ stack {
 	srcdir := filepath.Join(s.RootDir(), "stack")
 	destdir := filepath.Join(s.RootDir(), "cloned-stack")
 
-	err := stack.Clone(s.Config(), destdir, srcdir)
+	_, err := stack.Clone(s.Config(), destdir, srcdir, false)
 	assert.NoError(t, err)
 
 	cfg := test.ParseTerramateConfig(t, destdir)

@@ -3,11 +3,13 @@ coverage.txt
 .terraform
 .terraform.lock.hcl
 /cmd/terramate/terramate
+/testdata/testserver/my-user.tm
 
 # Profiling artifacts
 cpu.prof
 mem.prof
 *.test
+*.plan
 
 # Go Workspaces artifacts
 /go.work
@@ -17,3 +19,6 @@ mem.prof
 
 # Go releaser artifacts
 dist/
+
+# MacOS
+.DS_Store

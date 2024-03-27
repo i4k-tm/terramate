@@ -19,6 +19,11 @@ build/terramate:
 build/terramate-ls:
 	$(BUILD_ENV) go build $(GO_BUILD_FLAGS) -o bin/terramate-ls$(EXEC_SUFFIX) ./cmd/terramate-ls
 
+## Build tgdeps
+.PHONY: build/tgdeps
+build/tgdeps:
+	$(BUILD_ENV) go build $(GO_BUILD_FLAGS) -o bin/tgdeps$(EXEC_SUFFIX) ./cmd/tgdeps
+
 ## Install terramate tools on the host
 .PHONY: install
 install: install/terramate install/terramate-ls
@@ -33,6 +38,15 @@ install/terramate:
 .PHONY: install/terramate-ls
 install/terramate-ls:
 	$(BUILD_ENV) go install $(GO_BUILD_FLAGS) ./cmd/terramate-ls
+
+## Install tgdeps
+.PHONY: install/tgdeps
+install/tgdeps:
+	$(BUILD_ENV) go install $(GO_BUILD_FLAGS) ./cmd/tgdeps
+
+.PHONY: generate
+generate:
+	./bin/terramate generate
 
 ## Format go code
 .PHONY: fmt
@@ -68,6 +82,11 @@ coverage:
 .PHONY: coverage/show
 coverage/show: coverage
 	go tool cover -html=$(COVERAGE_REPORT)
+
+## run tests within docker
+.PHONY: test/docker
+test/docker:
+	docker build --progress=plain --rm -f containers/test/Dockerfile .
 
 ## start fuzzying to generate some new corpus/find errors on partial eval
 .PHONY: test/fuzz/eval
@@ -106,8 +125,8 @@ bench/all:
 bench/check: allocdelta="+20%"
 bench/check: timedelta="+20%"
 bench/check: name=github.com/terramate-io/terramate
-bench/check: pkg=./...
-bench/check: old=main
+bench/check: pkg?=./...
+bench/check: old?=main
 bench/check: new?=$(shell git rev-parse HEAD)
 bench/check:
 	@$(BENCH_CHECK) -mod $(name) -pkg $(pkg) -go-test-flags "-benchmem,-count=20,-run=Bench" \
@@ -161,4 +180,4 @@ help:
 				printf "  ${GREEN}%-30s${RESET} %s\n", cmd, msg; \
 			} \
 	} \
-	{ lastLine = $$0 }' $(MAKEFILE_LIST)
+	{ lastLine = $$0 }' $(MAKEFILE_LIST) | sort

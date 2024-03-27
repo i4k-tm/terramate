@@ -19,6 +19,7 @@ import (
 )
 
 func TestAssertConfigEval(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name       string
 		assert     hcl.AssertConfig
@@ -171,8 +172,10 @@ func TestAssertConfigEval(t *testing.T) {
 	}
 
 	for _, tcase := range tcases {
+		tcase := tcase
 		t.Run(tcase.name, func(t *testing.T) {
-			hclctx := eval.NewContext(stdlib.Functions(t.TempDir()))
+			t.Parallel()
+			hclctx := eval.NewContext(stdlib.Functions(test.TempDir(t)))
 
 			for k, v := range tcase.namespaces {
 				hclctx.SetNamespace(k, v.asCtyMap())

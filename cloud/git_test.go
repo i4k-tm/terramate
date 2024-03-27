@@ -8,16 +8,18 @@ import (
 
 	"github.com/madlambda/spells/assert"
 	"github.com/terramate-io/terramate/cloud"
+	"github.com/terramate-io/terramate/test"
 )
 
 func TestNormalizeGitURL(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name       string
 		raw        string
 		normalized string
 	}
 
-	tempDir := t.TempDir()
+	tempDir := test.TempDir(t)
 
 	for _, tc := range []testcase{
 		{

@@ -2,26 +2,26 @@
 # SPDX-License-Identifier: MPL-2.0
 
 name: ci
+
 on:
+  push:
+    branches:
+      - main
+      - v0.4.x
   pull_request:
-  merge_group:
 
 jobs:
   checks:
     runs-on: ubuntu-20.04
 
     steps:
-      - name: checkout repo
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
-          ref: ${{github.event.pull_request.head.ref}}
-          repository: ${{github.event.pull_request.head.repo.full_name}}
           fetch-depth: 0
 
-      - name: setup go
-        uses: actions/setup-go@v3
+      - uses: actions/setup-go@v4
         with:
-          go-version: "1.20"
+          go-version: '1.21'
 
       - name: Configure asdf and plugins needed
         uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
@@ -43,26 +43,24 @@ jobs:
       contents: read  # This is required for actions/checkout
 
     strategy:
-      fail-fast: false
       matrix:
-        os: ["ubuntu-20.04", "macos-11", "macos-12"]
-        go: ["1.20"]
+        os: ["ubuntu-20.04", "macos-12", "macos-13"]
+        go: ["1.21"]
 
     steps:
-      - name: checkout repo
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
-          ref: ${{github.event.pull_request.head.ref}}
-          repository: ${{github.event.pull_request.head.repo.full_name}}
+          ref: ${{ github.head_ref }}
           fetch-depth: 0
-
-      - name: setup go
-        uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
 
       - name: Configure asdf and plugins needed
         uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
+
+      - name: make generate
+        run: terramate generate
 
       - name: make test
         run: terramate run --tags golang --changed -- make test
@@ -71,7 +69,7 @@ jobs:
         run: terramate run --tags golang --changed -- make build
 
       - name: check cloud info
-        run: terramate run --tags golang --changed -- ./bin/terramate experimental cloud info
+        run: terramate run --tags golang --changed -- ./bin/terramate -vv experimental cloud info
 
   gh_integration_test:
     name: GHA Integration Test
@@ -79,17 +77,14 @@ jobs:
     runs-on: "ubuntu-20.04"
 
     steps:
-      - name: checkout repo
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           ref: ${{github.event.pull_request.head.ref}}
           repository: ${{github.event.pull_request.head.repo.full_name}}
           fetch-depth: 0
-
-      - name: setup go
-        uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.20"
+          go-version: '1.21'
 
       - name: Configure asdf and plugins needed
         uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
@@ -103,17 +98,14 @@ jobs:
     runs-on: ubuntu-20.04
 
     steps:
-      - name: checkout repo
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           ref: ${{github.event.pull_request.head.ref}}
           repository: ${{github.event.pull_request.head.repo.full_name}}
           fetch-depth: 0
-
-      - name: setup go
-        uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.20"
+          go-version: '1.21'
 
       - name: Configure asdf and plugins needed
         uses: asdf-vm/actions/install@83133f03f5693901c2296a8e622955087dc20267
@@ -126,8 +118,6 @@ jobs:
       - checks
       - build_test
       - gh_integration_test
-      - release_dry_run
     runs-on: ubuntu-20.04
     steps:
-      - name: Required Checks
-        run: echo "All required checks worked"
+      - uses: Kesin11/actions-timeline@v1

@@ -21,6 +21,7 @@ import (
 )
 
 func TestFormatMultiline(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name     string
 		input    string
@@ -1245,8 +1246,10 @@ var = [
 	}
 
 	for _, tcase := range tcases {
+		tcase := tcase
 		t.Run(tcase.name, func(t *testing.T) {
-			tempdir := t.TempDir()
+			t.Parallel()
+			tempdir := test.TempDir(t)
 
 			got, err := fmt.FormatMultiline(tcase.input, filepath.Join(tempdir, filename))
 
@@ -1350,30 +1353,10 @@ d = []
 			continue
 		}
 
-		// piggyback on the overall formatting scenarios to check
-		// for hcl.FormatTree behavior.
-		t.Run("Tree/"+tcase.name, func(t *testing.T) {
-			const (
-				filename   = "file.tm"
-				subdirName = "subdir"
-			)
-
-			rootdir := t.TempDir()
-			test.Mkdir(t, rootdir, subdirName)
-			subdir := filepath.Join(rootdir, subdirName)
-
-			test.WriteFile(t, rootdir, filename, tcase.input)
-			test.WriteFile(t, subdir, filename, tcase.input)
-
-			got, err := fmt.FormatTree(rootdir)
-
-			// Since we have identical files we expect the same
-			// set of errors for each filepath to be present.
-			wantFilepath := filepath.Join(rootdir, filename)
-			wantSubdirFilepath := filepath.Join(subdir, filename)
+		checkResults := func(t *testing.T, res []fmt.FormatResult, wantFiles []string, tcase testcase, gotErr error) {
 			wantErrs := []error{}
 
-			for _, path := range []string{wantFilepath, wantSubdirFilepath} {
+			for _, path := range wantFiles {
 				for _, wantErr := range tcase.wantErrs {
 					if e, ok := wantErr.(*errors.Error); ok {
 						err := *e
@@ -1386,39 +1369,77 @@ d = []
 				}
 
 			}
-			errtest.AssertErrorList(t, err, wantErrs)
-			if err != nil {
+			errtest.AssertErrorList(t, gotErr, wantErrs)
+			if gotErr != nil {
 				return
 			}
-			assert.EqualInts(t, 2, len(got), "want 2 formatted files, got: %v", got)
+			assert.EqualInts(t, 2, len(res), "want %d formatted files, got: %v", len(wantFiles), res)
 
-			for _, res := range got {
+			for _, res := range res {
 				assert.EqualStrings(t, tcase.want, res.Formatted())
 				assertFileContains(t, res.Path(), tcase.input)
 			}
 
-			assert.EqualStrings(t, wantFilepath, got[0].Path())
-			assert.EqualStrings(t, wantSubdirFilepath, got[1].Path())
+			for i, wantFile := range wantFiles {
+				assert.EqualStrings(t, wantFile, res[i].Path())
+			}
+		}
 
-			t.Run("saving format results", func(t *testing.T) {
-				for _, res := range got {
-					assert.NoError(t, res.Save())
-					assertFileContains(t, res.Path(), res.Formatted())
-				}
+		saveFiles := func(t *testing.T, rootdir string, res []fmt.FormatResult) {
+			for _, r := range res {
+				assert.NoError(t, r.Save())
+				assertFileContains(t, r.Path(), r.Formatted())
+			}
 
-				got, err := fmt.FormatTree(rootdir)
-				assert.NoError(t, err)
+			got, err := fmt.FormatTree(rootdir)
+			assert.NoError(t, err)
 
-				if len(got) > 0 {
-					t.Fatalf("after formatting want 0 fmt results, got: %v", got)
-				}
-			})
+			if len(got) > 0 {
+				t.Fatalf("after formatting want 0 fmt results, got: %v", got)
+			}
+		}
+
+		sandbox := func(t *testing.T) (string, []string) {
+			const (
+				filename   = "file.tm"
+				subdirName = "subdir"
+			)
+
+			rootdir := test.TempDir(t)
+			test.Mkdir(t, rootdir, subdirName)
+			subdir := filepath.Join(rootdir, subdirName)
+
+			wantFilepath := test.WriteFile(t, rootdir, filename, tcase.input)
+			wantSubdirFilepath := test.WriteFile(t, subdir, filename, tcase.input)
+			return rootdir, []string{wantFilepath, wantSubdirFilepath}
+		}
+
+		// piggyback on the overall formatting scenarios to check
+		// for hcl.FormatTree behavior.
+		t.Run("Tree/"+tcase.name, func(t *testing.T) {
+			rootdir, files := sandbox(t)
+			got, err := fmt.FormatTree(rootdir)
+			checkResults(t, got, files, tcase, err)
+			if err == nil {
+				saveFiles(t, rootdir, got)
+			}
+		})
+
+		// piggyback on the overall formatting scenarios to check
+		// for hcl.FormatFiles behavior.
+		t.Run("Files/"+tcase.name, func(t *testing.T) {
+			rootdir, files := sandbox(t)
+			got, err := fmt.FormatFiles(rootdir, files)
+			checkResults(t, got, files, tcase, err)
+			if err == nil {
+				saveFiles(t, rootdir, got)
+			}
 		})
 	}
 }
 
 func TestFormatTreeReturnsEmptyResultsForEmptyDir(t *testing.T) {
-	tmpdir := t.TempDir()
+	tmpdir := test.TempDir(t)
 	got, err := fmt.FormatTree(tmpdir)
 	assert.NoError(t, err)
 	assert.EqualInts(t, 0, len(got), "want no results, got: %v", got)
@@ -1426,11 +1447,11 @@ func TestFormatTreeReturnsEmptyResultsForEmptyDir(t *testing.T) {
 
 func TestFormatTreeFailsOnNonAccessibleSubdir(t *testing.T) {
 	const subdir = "subdir"
-	tmpdir := t.TempDir()
+	tmpdir := test.TempDir(t)
 	test.Mkdir(t, tmpdir, subdir)
 
-	test.Chmod(t, filepath.Join(tmpdir, subdir), 0)
-	defer test.Chmod(t, filepath.Join(tmpdir, subdir), 0755)
+	test.AssertChmod(t, filepath.Join(tmpdir, subdir), 0)
+	defer test.AssertChmod(t, filepath.Join(tmpdir, subdir), 0755)
 
 	_, err := fmt.FormatTree(tmpdir)
 	assert.Error(t, err)
@@ -1439,21 +1460,21 @@ func TestFormatTreeFailsOnNonAccessibleSubdir(t *testing.T) {
 func TestFormatTreeFailsOnNonAccessibleFile(t *testing.T) {
 	const filename = "filename.tm"
 
-	tmpdir := t.TempDir()
+	tmpdir := test.TempDir(t)
 	test.WriteFile(t, tmpdir, filename, `globals{
 	a = 2
 		b = 3
 	}`)
 
-	test.Chmod(t, filepath.Join(tmpdir, filename), 0)
-	defer test.Chmod(t, filepath.Join(tmpdir, filename), 0755)
+	test.AssertChmod(t, filepath.Join(tmpdir, filename), 0)
+	defer test.AssertChmod(t, filepath.Join(tmpdir, filename), 0755)
 
 	_, err := fmt.FormatTree(tmpdir)
 	assert.Error(t, err)
 }
 
 func TestFormatTreeFailsOnNonExistentDir(t *testing.T) {
-	tmpdir := t.TempDir()
+	tmpdir := test.TempDir(t)
 	_, err := fmt.FormatTree(filepath.Join(tmpdir, "non-existent"))
 	assert.Error(t, err)
 }
@@ -1469,7 +1490,7 @@ a = 1
 `
 	)
 
-	tmpdir := t.TempDir()
+	tmpdir := test.TempDir(t)
 	test.WriteFile(t, tmpdir, ".file.tm", unformattedCode)
 	test.WriteFile(t, tmpdir, "file.tf", unformattedCode)
 	test.WriteFile(t, tmpdir, "file.hcl", unformattedCode)

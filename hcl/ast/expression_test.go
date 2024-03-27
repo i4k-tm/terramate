@@ -15,6 +15,7 @@ import (
 )
 
 func TestAstExpressionToTokens(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name string
 		expr string
@@ -66,6 +67,15 @@ EOT
 			name: "oneline heredocs",
 			expr: `<<-EOT
 
+EOT
+`,
+		},
+		{
+			name: "heredocs with newlines",
+			expr: `<<-EOT
+Line 1
+Line 2. I want the following \ and n to be in the file: \n
+Line 3
 EOT
 `,
 		},
@@ -180,6 +190,11 @@ EOT
 			want: `"testက"`,
 		},
 		{
+			name: "rendered printable unicodes are also rendered when in quoted string",
+			expr: `"testက"`,
+			want: `"testက"`,
+		},
+		{
 			name: "single nl returns heredocs",
 			expr: `"\n"`,
 			want: `<<-EOT
@@ -235,6 +250,10 @@ EOT
 			expr: `"${a}\ntest\n${global.a}"`,
 		},
 		{
+			name: "escaping carriege returns",
+			expr: `"str \r str"`,
+		},
+		{
 			name: "render string when generating heredoc",
 			expr: `"\t${a}\n\ttest\n\t${global.a}\n"`,
 			want: "<<-EOT\n\t${a}\n\ttest\n\t${global.a}\nEOT\n",
@@ -247,6 +266,24 @@ EOT
 			name: "render escape characters",
 			expr: `"\n${a}${b}\t${b}\n\ntest\n\t${global.a}\n"`,
 			want: "<<-EOT\n\n${a}${b}\t${b}\n\ntest\n\t${global.a}\nEOT\n",
+		},
+		{
+			name: "render quotes",
+			expr: `"this is a \"test\" string"`,
+		},
+		{
+			name: "render quotes in heredocs",
+			expr: `<<-EOT
+this is a "test" string
+EOT
+`,
+		},
+		{
+			name: "render escaped quotes in heredocs",
+			expr: `<<-EOT
+this is a \"test\" string
+EOT
+`,
 		},
 		{
 			name: "utf-8",

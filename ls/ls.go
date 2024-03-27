@@ -23,6 +23,9 @@ import (
 	"go.lsp.dev/uri"
 )
 
+// MethodExecuteCommand is the LSP method name for invoking server commands.
+const MethodExecuteCommand = "workspace/executeCommand"
+
 // Server is the Language Server.
 type Server struct {
 	conn      jsonrpc2.Conn
@@ -65,6 +68,9 @@ func (s *Server) buildHandlers() {
 		lsp.MethodTextDocumentDidChange:  s.handleDocumentChange,
 		lsp.MethodTextDocumentDidSave:    s.handleDocumentSaved,
 		lsp.MethodTextDocumentCompletion: s.handleCompletion,
+
+		// commands
+		MethodExecuteCommand: s.handleExecuteCommand,
 	}
 }
 
@@ -84,7 +90,6 @@ func (s *Server) Handler(ctx context.Context, reply jsonrpc2.Replier, r jsonrpc2
 		return handler(ctx, reply, r, logger)
 	}
 
-	logger.Trace().Msg("not implemented")
 	return reply(ctx, nil, jsonrpc2.ErrMethodNotFound)
 }
 
@@ -331,16 +336,9 @@ func listFiles(fromFile string) ([]string, error) {
 		return nil, err
 	}
 
-	log.Trace().Msg("looking for Terramate files")
-
 	files := []string{}
 	for _, dirEntry := range dirEntries {
-		logger := log.With().
-			Str("entryName", dirEntry.Name()).
-			Logger()
-
 		if dirEntry.IsDir() {
-			logger.Trace().Msg("ignoring dir")
 			continue
 		}
 
@@ -364,14 +362,16 @@ func listFiles(fromFile string) ([]string, error) {
 // is handled separately because it can be unsaved.
 func (s *Server) checkFiles(files []string, currentFile string, currentContent string) error {
 	dir := filepath.Dir(currentFile)
-	_, rootdir, found, _ := config.TryLoadConfig(dir)
+	var experiments []string
+	root, rootdir, found, err := config.TryLoadConfig(dir)
+	if err == nil {
+		experiments = root.Tree().Node.Experiments()
+	}
 	if !found {
 		rootdir = s.workspace
 	}
 
-	log.Trace().Msgf("using project root: %s (found: %t)", rootdir, found)
-
-	parser, err := hcl.NewTerramateParser(rootdir, dir)
+	parser, err := hcl.NewTerramateParser(rootdir, dir, experiments...)
 	if err != nil {
 		return errors.E(err, "failed to create terramate parser")
 	}

@@ -11,11 +11,13 @@ import (
 	"github.com/madlambda/spells/assert"
 	"github.com/rs/zerolog"
 	"github.com/terramate-io/terramate/fs"
+	"github.com/terramate-io/terramate/test"
 	"github.com/terramate-io/terramate/test/sandbox"
 )
 
 func TestCopyIfAllFilesAreFilteredDirIsNotCreated(t *testing.T) {
-	s := sandbox.New(t)
+	t.Parallel()
+	s := sandbox.NoGit(t, true)
 	s.BuildTree([]string{
 		"f:test/1",
 		"f:test/2",
@@ -27,11 +29,10 @@ func TestCopyIfAllFilesAreFilteredDirIsNotCreated(t *testing.T) {
 		"f:test3/notcopy",
 	})
 
-	destdir := t.TempDir()
+	destdir := test.TempDir(t)
 	err := fs.CopyDir(destdir, s.RootDir(), func(path string, entry os.DirEntry) bool {
 		return entry.Name() != "notcopy" &&
-			entry.Name() != ".git" &&
-			entry.Name() != "README.md"
+			entry.Name() != "root.config.tm"
 	})
 
 	assert.NoError(t, err)

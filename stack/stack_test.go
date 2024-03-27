@@ -14,7 +14,8 @@ import (
 )
 
 func TestLoadAllFailsIfStacksIDIsNotUnique(t *testing.T) {
-	s := sandbox.New(t)
+	t.Parallel()
+	s := sandbox.NoGit(t, true)
 	s.BuildTree([]string{
 		"s:stacks/stack-1:id=terramate",
 		"s:stacks/stack-2:id=TerraMate",

@@ -25,6 +25,7 @@ import (
 )
 
 func TestVendorManifest(t *testing.T) {
+	t.Parallel()
 	type (
 		manifestConfig struct {
 			path     string
@@ -275,11 +276,14 @@ func TestVendorManifest(t *testing.T) {
 	}
 
 	for _, tcase := range testcases {
+		tcase := tcase
 		t.Run(tcase.name, func(t *testing.T) {
+			t.Parallel()
 			repoSandbox := sandbox.New(t)
 
 			// Remove the default README.md created by the sandbox
 			test.RemoveFile(t, repoSandbox.RootDir(), "README.md")
+			test.RemoveFile(t, repoSandbox.RootDir(), ".gitignore")
 
 			for _, file := range tcase.files {
 				path := filepath.Join(repoSandbox.RootDir(), file)
@@ -307,7 +311,7 @@ func TestVendorManifest(t *testing.T) {
 			repogit.CommitAll("setup vendored repo")
 
 			gitURI := uri.File(repoSandbox.RootDir())
-			rootdir := t.TempDir()
+			rootdir := test.TempDir(t)
 			source := newSource(t, gitURI, "main")
 
 			vendordir := project.NewPath("/vendor")
@@ -333,6 +337,7 @@ func TestInvalidManifestFailsDotTerramate(t *testing.T) {
 }
 
 func testInvalidManifestFails(t *testing.T, configpath string) {
+	t.Parallel()
 	repoSandbox := sandbox.New(t)
 	test.WriteFile(t, repoSandbox.RootDir(), configpath, "not valid HCL")
 

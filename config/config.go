@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/exp/slices"
+
 	"github.com/rs/zerolog/log"
 	"github.com/terramate-io/terramate"
 	"github.com/terramate-io/terramate/config/filter"
@@ -54,6 +56,8 @@ type Tree struct {
 	// Parent is the parent node or nil if none.
 	Parent *Tree
 
+	stack *Stack
+
 	dir string
 }
 
@@ -73,27 +77,23 @@ type List[T DirElem] []T
 // configpath != "" and found as true.
 func TryLoadConfig(fromdir string) (tree *Root, configpath string, found bool, err error) {
 	for {
-		logger := log.With().
-			Str("action", "config.TryLoadConfig()").
-			Str("path", fromdir).
-			Logger()
-
-		logger.Trace().Msg("Parse Terramate config.")
-
-		cfg, err := hcl.ParseDir(fromdir, fromdir)
+		ok, err := hcl.IsRootConfig(fromdir)
 		if err != nil {
-			// the imports only works for the correct rootdir.
-			// As we are looking for the rootdir, we should ignore ErrImport
-			// errors.
-			if !errors.IsKind(err, hcl.ErrImport) {
-				return nil, "", false, err
-			}
-		} else if cfg.Terramate != nil && cfg.Terramate.Config != nil {
-			tree, err := loadTree(fromdir, fromdir, &cfg)
+			return nil, "", false, err
+		}
+
+		if ok {
+			cfg, err := hcl.ParseDir(fromdir, fromdir)
 			if err != nil {
 				return nil, fromdir, true, err
 			}
-			return NewRoot(tree), fromdir, true, err
+			rootTree := NewTree(fromdir)
+			rootTree.Node = cfg
+			_, err = loadTree(rootTree, fromdir, nil)
+			if err != nil {
+				return nil, fromdir, true, err
+			}
+			return NewRoot(rootTree), fromdir, true, err
 		}
 
 		parent, ok := parentDir(fromdir)
@@ -142,8 +142,6 @@ func (root *Root) StacksByPaths(base project.Path, relpaths ...string) List[*Tre
 		Strs("paths", relpaths).
 		Logger()
 
-	logger.Trace().Msg("lookup paths")
-
 	normalizePaths := func(paths []string) []project.Path {
 		pathmap := map[string]struct{}{}
 		var normalized []project.Path
@@ -173,8 +171,6 @@ func (root *Root) StacksByPaths(base project.Path, relpaths ...string) List[*Tre
 	}
 
 	sort.Sort(stacks)
-
-	logger.Trace().Msgf("found %d stacks out of %d paths", len(stacks), len(relpaths))
 
 	return stacks
 }
@@ -274,7 +270,13 @@ func (root *Root) initRuntime() {
 // LoadTree loads the whole hierarchical configuration from cfgdir downwards
 // using rootdir as project root.
 func LoadTree(rootdir string, cfgdir string) (*Tree, error) {
-	return loadTree(rootdir, cfgdir, nil)
+	cfg, err := hcl.ParseDir(rootdir, rootdir)
+	if err != nil {
+		return nil, err
+	}
+	root := NewTree(rootdir)
+	root.Node = cfg
+	return loadTree(root, cfgdir, nil)
 }
 
 // HostDir is the node absolute directory in the host.
@@ -306,6 +308,18 @@ func (tree *Tree) Root() *Root {
 // IsStack tells if the node is a stack.
 func (tree *Tree) IsStack() bool {
 	return tree.Node.Stack != nil
+}
+
+// Stack returns the stack object.
+func (tree *Tree) Stack() (*Stack, error) {
+	if tree.stack == nil {
+		s, err := LoadStack(tree.Root(), tree.Dir())
+		if err != nil {
+			return nil, err
+		}
+		tree.stack = s
+	}
+	return tree.stack, nil
 }
 
 // Stacks returns the stack nodes from the tree.
@@ -367,10 +381,10 @@ func (l List[T]) Len() int           { return len(l) }
 func (l List[T]) Less(i, j int) bool { return l[i].Dir().String() < l[j].Dir().String() }
 func (l List[T]) Swap(i, j int)      { l[i], l[j] = l[j], l[i] }
 
-func loadTree(rootdir string, cfgdir string, rootcfg *hcl.Config) (_ *Tree, err error) {
+func loadTree(parentTree *Tree, cfgdir string, rootcfg *hcl.Config) (_ *Tree, err error) {
 	logger := log.With().
 		Str("action", "config.loadTree()").
-		Str("dir", rootdir).
+		Str("dir", cfgdir).
 		Logger()
 
 	f, err := os.Open(cfgdir)
@@ -382,61 +396,52 @@ func loadTree(rootdir string, cfgdir string, rootcfg *hcl.Config) (_ *Tree, err 
 		err = errors.L(err, f.Close()).AsError()
 	}()
 
-	logger.Trace().Msg("reading directory file names")
-
-	names, err := f.Readdirnames(0)
+	dirEntries, err := f.ReadDir(-1)
 	if err != nil {
 		return nil, errors.E(err, "failed to read files in %s", cfgdir)
 	}
 
-	for _, name := range names {
-		if name == SkipFilename {
+	for _, dirEntry := range dirEntries {
+		fname := dirEntry.Name()
+		if fname == SkipFilename {
 			logger.Debug().Msg("skip file found: skipping whole subtree")
 			return NewTree(cfgdir), nil
 		}
 	}
 
-	tree := NewTree(cfgdir)
-	if rootcfg != nil {
-		tree.Node = *rootcfg
-	} else {
-		cfg, err := hcl.ParseDir(rootdir, cfgdir)
+	if parentTree != nil && rootcfg == nil {
+		rootcfg = &parentTree.Root().Tree().Node
+	}
+
+	if cfgdir != parentTree.RootDir() {
+		tree := NewTree(cfgdir)
+
+		cfg, err := hcl.ParseDir(parentTree.RootDir(), cfgdir, rootcfg.Experiments()...)
 		if err != nil {
 			return nil, err
 		}
 		tree.Node = cfg
+		tree.Parent = parentTree
+		parentTree.Children[filepath.Base(cfgdir)] = tree
+
+		parentTree = tree
 	}
-
-	for _, name := range names {
-		logger = logger.With().
-			Str("filename", name).
-			Logger()
-
-		if Skip(name) {
-			logger.Trace().Msg("skipping file")
-			continue
-		}
-		dir := filepath.Join(cfgdir, name)
-		st, err := os.Lstat(dir)
-		if err != nil {
-			return nil, errors.E(err, "failed to stat %s", dir)
-		}
-		if !st.IsDir() {
-			logger.Trace().Msg("ignoring non-directory file")
+	for _, dirEntry := range dirEntries {
+		fname := dirEntry.Name()
+		if Skip(fname) || !dirEntry.IsDir() {
 			continue
 		}
 
-		logger.Trace().Msg("loading children tree")
-
-		node, err := LoadTree(rootdir, dir)
+		dir := filepath.Join(cfgdir, fname)
+		node, err := loadTree(parentTree, dir, rootcfg)
 		if err != nil {
 			return nil, errors.E(err, "loading from %s", dir)
 		}
 
-		node.Parent = tree
-		tree.Children[name] = node
+		node.Parent = parentTree
+		parentTree.Children[fname] = node
 	}
-	return tree, nil
+	return parentTree, nil
 }
 
 // IsEmptyConfig tells if the configuration is empty.
@@ -465,6 +470,15 @@ func NewTree(cfgdir string) *Tree {
 		dir:      cfgdir,
 		Children: make(map[string]*Tree),
 	}
+}
+
+// HasExperiment returns true if the given experiment name is set.
+func (root *Root) HasExperiment(name string) bool {
+	if root.tree.Node.Terramate == nil || root.tree.Node.Terramate.Config == nil {
+		return false
+	}
+
+	return slices.Contains(root.tree.Node.Terramate.Config.Experiments, name)
 }
 
 // Skip returns true if the given file/dir name should be ignored by Terramate.

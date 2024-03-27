@@ -1,13 +1,16 @@
 // Copyright 2023 Terramate GmbH
 // SPDX-License-Identifier: MPL-2.0
 
-//go:build linux
+//go:build linux || darwin
 
 package git_test
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/madlambda/spells/assert"
@@ -20,6 +23,7 @@ import (
 const CookedCommitID = "4e991b55e3d58b9c3137a791a9986ed9c5069697"
 
 func TestGit(t *testing.T) {
+	t.Parallel()
 	git, err := git.WithConfig(git.Config{})
 	assert.NoError(t, err, "new git wrapper")
 
@@ -30,6 +34,7 @@ func TestGit(t *testing.T) {
 }
 
 func TestGitLog(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		repo    func(t *testing.T) string
 		revs    []string
@@ -123,12 +128,27 @@ func TestGitLog(t *testing.T) {
 }
 
 func TestRevParse(t *testing.T) {
+	t.Parallel()
 	repodir := mkOneCommitRepo(t)
 
 	git := test.NewGitWrapper(t, repodir, []string{})
 	out, err := git.RevParse("main")
 	assert.NoError(t, err, "rev-parse failed")
 	assert.EqualStrings(t, CookedCommitID, out, "commit mismatch")
+}
+
+func TestGitOptions(t *testing.T) {
+	t.Parallel()
+	repodir1 := mkOneCommitRepo(t)
+	repodir2 := mkOneCommitRepo(t)
+
+	git := test.NewGitWrapper(t, repodir1, []string{})
+	gotRepoDir1, err := git.Root()
+	assert.NoError(t, err, "root failed")
+	assert.EqualStrings(t, repodir1, gotRepoDir1)
+	gotRepoDir2, err := git.With().WorkingDir(repodir2).Wrapper().Root()
+	assert.NoError(t, err)
+	assert.EqualStrings(t, repodir2, gotRepoDir2)
 }
 
 func TestClone(t *testing.T) {
@@ -143,7 +163,7 @@ func TestClone(t *testing.T) {
 	git.CommitAll("add file")
 
 	repoURL := "file://" + s.RootDir()
-	cloneDir := t.TempDir()
+	cloneDir := test.TempDir(t)
 	git.Clone(repoURL, cloneDir)
 
 	got := test.ReadFile(t, cloneDir, filename)
@@ -151,6 +171,7 @@ func TestClone(t *testing.T) {
 }
 
 func TestCurrentBranch(t *testing.T) {
+	t.Parallel()
 	s := sandbox.New(t)
 	git := s.Git()
 
@@ -163,6 +184,7 @@ func TestCurrentBranch(t *testing.T) {
 }
 
 func TestFetchRemoteRev(t *testing.T) {
+	t.Parallel()
 	repodir := mkOneCommitRepo(t)
 	git := test.NewGitWrapper(t, repodir, []string{})
 
@@ -190,6 +212,7 @@ func TestFetchRemoteRev(t *testing.T) {
 }
 
 func TestFetchRemoteRevErrorHandling(t *testing.T) {
+	t.Parallel()
 	repodir := mkOneCommitRepo(t)
 	git := test.NewGitWrapper(t, repodir, []string{})
 	// should fail because the repo has no origin remote set.
@@ -198,6 +221,7 @@ func TestFetchRemoteRevErrorHandling(t *testing.T) {
 }
 
 func TestListingAvailableRemotes(t *testing.T) {
+	t.Parallel()
 	type testcase struct {
 		name string
 		want []git.Remote
@@ -259,7 +283,9 @@ func TestListingAvailableRemotes(t *testing.T) {
 	}
 
 	for _, tc := range tests {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			repodir := mkOneCommitRepo(t)
 			g := test.NewGitWrapper(t, repodir, []string{})
 
@@ -294,6 +320,7 @@ func TestListingAvailableRemotes(t *testing.T) {
 }
 
 func TestListRemoteWithMultipleBranches(t *testing.T) {
+	t.Parallel()
 	const (
 		remote = "origin"
 	)
@@ -325,10 +352,122 @@ func TestListRemoteWithMultipleBranches(t *testing.T) {
 	assertEqualRemotes(t, got, want)
 }
 
+func TestShowMetadata(t *testing.T) {
+	type testcase struct {
+		name        string
+		title       string
+		description string
+	}
+
+	tests := []testcase{
+		{
+			name:        "title-only",
+			title:       "add feature x",
+			description: "",
+		},
+		{
+			name:        "title with single-line description",
+			title:       "add feature y",
+			description: "this is the latest feature",
+		},
+		{
+			name:  "title with multi-line description",
+			title: "add feature y",
+			description: `this is the latest feature:
+				* a
+				* b
+				* c`,
+		},
+	}
+
+	for _, tc := range tests {
+		repodir := test.EmptyRepo(t, false)
+
+		env := []string{
+			"GIT_COMMITTER_DATE=1597490918 +0530",
+			"GIT_AUTHOR_DATE=1597490918 +0530",
+			"GIT_COMMITTER_NAME=" + test.Username,
+			"GIT_AUTHOR_NAME=" + test.Username,
+			"GIT_COMMITTER_EMAIL=" + test.Email,
+			"GIT_AUTHOR_EMAIL=" + test.Email,
+		}
+
+		commitTime := time.Unix(1597490918, 0)
+
+		gw := test.NewGitWrapper(t, repodir, env)
+		filename := test.WriteFile(t, repodir, "README.md", "# Test")
+		assert.NoError(t, gw.Add(filename), "git add %s", filename)
+
+		commitMsg := tc.title
+		if tc.description != "" {
+			// git commit message uses two newlines to separate subject and body
+			commitMsg += "\n\n" + tc.description
+		}
+
+		err := gw.Commit(commitMsg)
+		assert.NoError(t, err, "commit")
+
+		got, err := gw.ShowCommitMetadata("HEAD")
+		assert.NoError(t, err)
+
+		want := &git.CommitMetadata{
+			Author:  test.Username,
+			Email:   test.Email,
+			Time:    &commitTime,
+			Subject: tc.title,
+			Body:    tc.description,
+		}
+
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Fatalf(
+				"failed test '%s', got metadata %v != want %v. Details (got-, want+):\n%s",
+				tc.name,
+				got,
+				want,
+				diff,
+			)
+		}
+	}
+}
+
+func TestGetConfigValue(t *testing.T) {
+	repodir := mkOneCommitRepo(t)
+
+	gw, err := git.WithConfig(git.Config{
+		Username:       test.Username,
+		Email:          test.Email,
+		WorkingDir:     repodir,
+		Isolated:       true,
+		Env:            []string{},
+		AllowPorcelain: true,
+		GlobalArgs:     []string{"-c", fmt.Sprintf("safe.directory=%s", repodir)},
+	})
+	assert.NoError(t, err, "new git wrapper")
+
+	// Existing values
+	tests := map[string]string{
+		"user.name":      test.Username,
+		"user.email":     test.Email,
+		"safe.directory": repodir,
+	}
+
+	for k, v := range tests {
+		out, err := gw.GetConfigValue(k)
+		assert.NoError(t, err, "git config %s", k)
+		assert.EqualStrings(t, v, out)
+	}
+
+	// Non-existing value
+	_, err = gw.GetConfigValue("nothing")
+	assert.Error(t, err, "git config: non-existing key")
+}
+
 const defaultBranch = "main"
 
 func mkOneCommitRepo(t *testing.T) string {
-	repodir := test.EmptyRepo(t, false)
+	dir := test.EmptyRepo(t, false)
+	repodir, err := filepath.EvalSymlinks(dir)
+	assert.NoError(t, err)
 
 	// Fixing all the information used to create the SHA-1 below:
 	// CommitID: a022c39b57b1e711fb9298a05aacc699773e6d36
@@ -348,7 +487,7 @@ func mkOneCommitRepo(t *testing.T) string {
 	filename := test.WriteFile(t, repodir, "README.md", "# Test")
 	assert.NoError(t, gw.Add(filename), "git add %s", filename)
 
-	err := gw.Commit("some message")
+	err = gw.Commit("some message")
 	assert.NoError(t, err, "commit")
 
 	return repodir

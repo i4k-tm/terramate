@@ -30,6 +30,7 @@ type testcase struct {
 }
 
 func TestEvalTmFuncall(t *testing.T) {
+	t.Parallel()
 	tcases := []testcase{
 		{
 			name: "tm_ternary - cond is true, with primitive values",
@@ -71,7 +72,9 @@ func TestEvalTmFuncall(t *testing.T) {
 	tcases = append(tcases, tmAbspathTestcases(t)...)
 
 	for _, tc := range tcases {
+		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			basedir := tc.basedir
 			if basedir == "" {
 				basedir = root(t)
@@ -81,7 +84,7 @@ func TestEvalTmFuncall(t *testing.T) {
 			const attrname = "value"
 
 			cfg := fmt.Sprintf("%s = %s", attrname, strings.ReplaceAll(tc.expr, `\`, `\\`))
-			fname := test.WriteFile(t, t.TempDir(), "test-tm_ternary.hcl", cfg)
+			fname := test.WriteFile(t, test.TempDir(t), "test-tm_ternary.hcl", cfg)
 			parser := hclparse.NewParser()
 			file, diags := parser.ParseHCL([]byte(cfg), fname)
 			if diags.HasErrors() {

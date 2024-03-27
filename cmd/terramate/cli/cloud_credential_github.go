@@ -5,6 +5,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/terramate-io/terramate/cmd/terramate/cli/github"
 	"github.com/terramate-io/terramate/cmd/terramate/cli/out"
 	"github.com/terramate-io/terramate/errors"
+	"github.com/terramate-io/terramate/printer"
 )
 
 const githubOIDCProviderName = "GitHub Actions OIDC"
@@ -29,17 +31,18 @@ type githubOIDC struct {
 	repoOwner string
 	repoName  string
 
-	reqURL      string
-	reqToken    string
-	isValidated bool
-	orgs        cloud.MemberOrganizations
+	reqURL   string
+	reqToken string
+	orgs     cloud.MemberOrganizations
 
 	output out.O
+	client *cloud.Client
 }
 
-func newGithubOIDC(output out.O) *githubOIDC {
+func newGithubOIDC(output out.O, client *cloud.Client) *githubOIDC {
 	return &githubOIDC{
 		output: output,
+		client: client,
 	}
 }
 
@@ -68,7 +71,11 @@ func (g *githubOIDC) Load() (bool, error) {
 	}
 
 	err := g.Refresh()
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	g.client.Credential = g
+	return true, g.fetchDetails()
 }
 
 func (g *githubOIDC) Name() string {
@@ -87,12 +94,22 @@ func (g *githubOIDC) ExpireAt() time.Time {
 	return g.expireAt
 }
 
-func (g *githubOIDC) Refresh() error {
+func (g *githubOIDC) Refresh() (err error) {
+	if g.token != "" {
+		g.output.MsgStdOutV("refreshing token...")
+
+		defer func() {
+			if err == nil {
+				g.output.MsgStdOutV("token successfully refreshed.")
+				g.output.MsgStdOutV("next token refresh in: %s", time.Until(g.ExpireAt()))
+			}
+		}()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
 	defer cancel()
 
-	client := github.Client{}
-	token, err := client.OIDCToken(ctx, github.OIDCVars{
+	token, err := github.OIDCToken(ctx, github.OIDCVars{
 		ReqURL:   g.reqURL,
 		ReqToken: g.reqToken,
 	})
@@ -161,47 +178,45 @@ func (g *githubOIDC) Token() (string, error) {
 }
 
 // Validate if the credential is ready to be used.
-func (g *githubOIDC) Validate(cloudcfg cloudConfig) error {
+func (g *githubOIDC) fetchDetails() error {
 	const apiTimeout = 5 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
 	defer cancel()
-	orgs, err := cloudcfg.client.MemberOrganizations(ctx)
+	orgs, err := g.client.MemberOrganizations(ctx)
 	if err != nil {
 		return err
 	}
-
-	g.isValidated = true
 	g.orgs = orgs
 	return nil
 }
 
-func (g *githubOIDC) Info() {
-	if !g.isValidated {
-		panic(errors.E(errors.ErrInternal, "cred.Info() called for unvalidated credential"))
-	}
-
+func (g *githubOIDC) info(selectedOrgName string) {
 	if len(g.orgs) > 0 && g.orgs[0].Status == "trusted" {
-		g.output.MsgStdOut("status: signed in")
+		printer.Stdout.Println("status: signed in")
 	} else {
-		g.output.MsgStdOut("status: untrusted")
+		printer.Stdout.Println("status: untrusted")
 	}
 
-	g.output.MsgStdOut("provider: %s", g.Name())
+	printer.Stdout.Println(fmt.Sprintf("provider: %s", g.Name()))
 
 	for _, kv := range g.DisplayClaims() {
-		g.output.MsgStdOut("%s: %s", kv.key, kv.value)
+		printer.Stdout.Println(fmt.Sprintf("%s: %s", kv.key, kv.value))
 	}
 
 	if len(g.orgs) > 0 {
-		g.output.MsgStdOut("organizations: %s", g.orgs)
+		printer.Stdout.Println(fmt.Sprintf("organizations: %s", g.orgs))
 	}
+
+	if selectedOrgName == "" && len(g.orgs) > 1 {
+		printer.Stderr.Warn("User is member of multiple organizations but none was selected")
+	}
+
 	if len(g.orgs) == 0 {
-		g.output.MsgStdErr("Warning: You are not part of an organization. Please visit cloud.terramate.io to create an organization.")
+		printer.Stderr.Warn("You are not part of an organization. Please visit cloud.terramate.io to create an organization.")
 	}
 }
 
-// organizations returns the list of organizations associated with the credential.
 func (g *githubOIDC) organizations() cloud.MemberOrganizations {
 	return g.orgs
 }

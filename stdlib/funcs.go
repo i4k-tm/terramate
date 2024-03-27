@@ -49,6 +49,10 @@ func Functions(basedir string) map[string]function.Function {
 	scope := &tflang.Scope{BaseDir: basedir}
 	tffuncs := scope.Functions()
 
+	// not supported functions
+	delete(tffuncs, "sensitive")
+	delete(tffuncs, "nonsensitive")
+
 	tmfuncs := map[string]function.Function{}
 	for name, function := range tffuncs {
 		tmfuncs["tm_"+name] = function
@@ -62,6 +66,9 @@ func Functions(basedir string) map[string]function.Function {
 
 	// sane ternary
 	tmfuncs["tm_ternary"] = TernaryFunc()
+
+	// optimized try
+	tmfuncs["tm_try"] = TryFunc()
 
 	tmfuncs["tm_version_match"] = VersionMatch()
 	return tmfuncs

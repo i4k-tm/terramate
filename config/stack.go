@@ -218,12 +218,6 @@ func (s *Stack) HostDir(root *Root) string {
 
 // RuntimeValues returns the runtime "terramate" namespace for the stack.
 func (s *Stack) RuntimeValues(root *Root) map[string]cty.Value {
-	logger := log.With().
-		Str("action", "stack.stackMetaToCtyMap()").
-		Logger()
-
-	logger.Trace().Msg("creating stack metadata")
-
 	stackpath := cty.ObjectVal(map[string]cty.Value{
 		"absolute": cty.StringVal(s.Dir.String()),
 		"relative": cty.StringVal(s.RelPath()),
@@ -237,10 +231,6 @@ func (s *Stack) RuntimeValues(root *Root) map[string]cty.Value {
 		"path":        stackpath,
 	}
 	if s.ID != "" {
-		logger.Trace().
-			Str("id", s.ID).
-			Msg("adding stack ID to metadata")
-
 		stackMapVals["id"] = cty.StringVal(s.ID)
 	}
 	stack := cty.ObjectVal(stackMapVals)
@@ -289,12 +279,12 @@ func validateWatchPaths(rootdir string, stackpath string, paths []string) (proje
 }
 
 // StacksFromTrees converts a List[*Tree] into a List[*Stack].
-func StacksFromTrees(root string, trees List[*Tree]) (List[*SortableStack], error) {
+func StacksFromTrees(trees List[*Tree]) (List[*SortableStack], error) {
 	var stacks List[*SortableStack]
 	for _, tree := range trees {
-		s, err := NewStackFromHCL(root, tree.Node)
+		s, err := tree.Stack()
 		if err != nil {
-			return List[*SortableStack]{}, err
+			return nil, err
 		}
 		stacks = append(stacks, &SortableStack{s})
 	}
@@ -312,9 +302,9 @@ func LoadAllStacks(cfg *Tree) (List[*SortableStack], error) {
 	stacksIDs := map[string]*Stack{}
 
 	for _, stackNode := range cfg.Stacks() {
-		stack, err := NewStackFromHCL(cfg.RootDir(), stackNode.Node)
+		stack, err := stackNode.Stack()
 		if err != nil {
-			return List[*SortableStack]{}, err
+			return nil, err
 		}
 
 		logger := logger.With().
@@ -325,7 +315,6 @@ func LoadAllStacks(cfg *Tree) (List[*SortableStack], error) {
 		stacks = append(stacks, stack.Sortable())
 
 		if stack.ID != "" {
-			logger.Trace().Msg("stack has ID, checking for duplicate")
 			if otherStack, ok := stacksIDs[strings.ToLower(stack.ID)]; ok {
 				return List[*SortableStack]{}, errors.E(ErrStackDuplicatedID,
 					"stack %q and %q have same ID %q",
@@ -365,11 +354,8 @@ func TryLoadStack(root *Root, cfgdir project.Path) (stack *Stack, found bool, er
 		return nil, false, nil
 	}
 
-	s, err := NewStackFromHCL(root.HostDir(), tree.Node)
-	if err != nil {
-		return nil, true, err
-	}
-	return s, true, nil
+	s, err := tree.Stack()
+	return s, true, err
 }
 
 // ReverseStacks reverses the given stacks slice.

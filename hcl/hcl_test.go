@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/terramate-io/terramate/errors"
 	"github.com/terramate-io/terramate/hcl"
+	"github.com/terramate-io/terramate/safeguard"
 	"github.com/terramate-io/terramate/test"
 	errtest "github.com/terramate-io/terramate/test/errors"
 	. "github.com/terramate-io/terramate/test/hclutils"
@@ -33,9 +34,11 @@ type (
 		name      string
 		nonStrict bool
 		parsedir  string
-		rootdir   string
-		input     []cfgfile
-		want      want
+		// whether the experiments config should be loaded from rootdir
+		loadExperimentsConfig bool
+		rootdir               string
+		input                 []cfgfile
+		want                  want
 	}
 )
 
@@ -320,12 +323,284 @@ func TestHCLParserTerramateBlock(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "terramate.config.experiments with wrong type",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								experiments = 1
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 23, 60), End(4, 24, 61))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.experiments with wrong item type",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								experiments = ["A", 1, "B"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 23, 60), End(4, 36, 73))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.experiments with duplicates",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								experiments = ["A", "B", "A"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 23, 60), End(4, 38, 75))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.experiments with empty set",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								experiments = []
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Experiments: []string{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "terramate.config.experiments with correct values",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								experiments = ["scripts", "awesome-feature"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Experiments: []string{"scripts", "awesome-feature"},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with wrong type",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = 1
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 30, 67), End(4, 31, 68))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with wrong item type",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = ["A", 1, "B"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 30, 67), End(4, 43, 80))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with duplicates",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = ["A", "B", "A"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 30, 67), End(4, 45, 82))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards conflicts with deprecated configs",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = ["git-untracked"]
+
+								git {
+                                  check_untracked = false
+								}
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(7, 53, 152), End(7, 58, 157))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with invalid values",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = ["non-existent"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("cfg.tm", Start(4, 30, 67), End(4, 46, 83))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with empty set",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = []
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							DisableSafeguards: safeguard.Keywords{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "terramate.config.disable_safeguards with correct values",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+						    config {
+								disable_safeguards = ["git", "outdated-code"]
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							DisableSafeguards: safeguard.Keywords{
+								safeguard.Git,
+								safeguard.Outdated,
+							},
+						},
+					},
+				},
+			},
+		},
 	} {
 		testParser(t, tc)
 	}
 }
 
 func TestHCLParserRootConfig(t *testing.T) {
+	ptr := func(s string) *string { return &s }
 	for _, tc := range []testcase{
 		{
 			name: "no config returns empty config",
@@ -425,7 +700,7 @@ func TestHCLParserRootConfig(t *testing.T) {
 							Git: &hcl.GitConfig{
 								CheckUntracked:   true,
 								CheckUncommitted: true,
-								CheckRemote:      true,
+								CheckRemote:      hcl.CheckIsUnset,
 							},
 						},
 					},
@@ -477,7 +752,7 @@ func TestHCLParserRootConfig(t *testing.T) {
 								DefaultBranch:    "trunk",
 								CheckUntracked:   true,
 								CheckUncommitted: true,
-								CheckRemote:      true,
+								CheckRemote:      hcl.CheckIsUnset,
 							},
 						},
 					},
@@ -495,7 +770,6 @@ func TestHCLParserRootConfig(t *testing.T) {
 								git {
 									default_branch          = "trunk"
 									default_remote          = "upstream"
-									default_branch_base_ref = "HEAD~2"
 									check_untracked         = false
 									check_uncommitted       = false
 									check_remote            = false
@@ -510,12 +784,11 @@ func TestHCLParserRootConfig(t *testing.T) {
 					Terramate: &hcl.Terramate{
 						Config: &hcl.RootConfig{
 							Git: &hcl.GitConfig{
-								DefaultBranch:        "trunk",
-								DefaultRemote:        "upstream",
-								DefaultBranchBaseRef: "HEAD~2",
-								CheckUntracked:       false,
-								CheckUncommitted:     false,
-								CheckRemote:          false,
+								DefaultBranch:    "trunk",
+								DefaultRemote:    "upstream",
+								CheckUntracked:   false,
+								CheckUncommitted: false,
+								CheckRemote:      hcl.CheckIsFalse,
 							},
 						},
 					},
@@ -543,7 +816,7 @@ func TestHCLParserRootConfig(t *testing.T) {
 							Git: &hcl.GitConfig{
 								CheckUntracked:   true,
 								CheckUncommitted: true,
-								CheckRemote:      true,
+								CheckRemote:      hcl.CheckIsUnset,
 							},
 						},
 					},
@@ -576,6 +849,116 @@ func TestHCLParserRootConfig(t *testing.T) {
 						Mkrange("cfg.tm", Start(6, 30, 112), End(6, 33, 115))),
 					errors.E(hcl.ErrTerramateSchema,
 						Mkrange("cfg.tm", Start(7, 30, 145), End(7, 32, 147))),
+				},
+			},
+		},
+		{
+			name: "empty config.cloud block",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+							config {
+								cloud {}
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Cloud: &hcl.CloudConfig{
+								Organization: "",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "basic config.cloud block",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+							config {
+								cloud {
+									organization = "my-org"
+								}
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Cloud: &hcl.CloudConfig{
+								Organization: "my-org",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "terramate.config.generate.hcl_magic_header_comment_style = //",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+							config {
+								generate {
+									hcl_magic_header_comment_style = "//"
+								}
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Generate: &hcl.GenerateRootConfig{
+								HCLMagicHeaderCommentStyle: ptr("//"),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "terramate.config.generate.hcl_magic_header_comment_style = #",
+			input: []cfgfile{
+				{
+					filename: "cfg.tm",
+					body: `
+						terramate {
+							config {
+								generate {
+									hcl_magic_header_comment_style = "#"
+								}
+							}
+						}
+					`,
+				},
+			},
+			want: want{
+				config: hcl.Config{
+					Terramate: &hcl.Terramate{
+						Config: &hcl.RootConfig{
+							Generate: &hcl.GenerateRootConfig{
+								HCLMagicHeaderCommentStyle: ptr("#"),
+							},
+						},
+					},
 				},
 			},
 		},
@@ -752,6 +1135,155 @@ func TestHCLParserMultipleErrors(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "terramate.config.generate..hcl_magic_header_comment_style is not string -- fail",
+			input: []cfgfile{
+				{
+					filename: "tm.tm",
+					body: `
+					terramate {
+						config {
+							generate {
+								hcl_magic_header_comment_style = 1
+							}
+						}
+					}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("tm.tm", Start(5, 42, 92), End(5, 43, 93))),
+				},
+			},
+		},
+		{
+			name: "terramate.config.generate..hcl_magic_header_comment_style with unknown value",
+			input: []cfgfile{
+				{
+					filename: "tm.tm",
+					body: `
+					terramate {
+						config {
+							generate {
+								hcl_magic_header_comment_style = "/*"
+							}
+						}
+					}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema,
+						Mkrange("tm.tm", Start(5, 42, 92), End(5, 46, 96))),
+				},
+			},
+		},
+	} {
+		testParser(t, tc)
+	}
+}
+
+func TestHCLParserGenerateStackFilters(t *testing.T) {
+	for _, tc := range []testcase{
+		{
+			name: "generate_file - invalid project_paths list",
+			input: []cfgfile{
+				{
+					filename: "gen.tm",
+					body: `
+						generate_file "test.tf" {
+							stack_filter { project_paths = "*" }
+							content = "foo"
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
+		{
+			name: "generate_hcl - invalid project_paths list",
+			input: []cfgfile{
+				{
+					filename: "gen.tm",
+					body: `
+						generate_hcl "test.tf" {
+							stack_filter { project_paths = "*" }
+							content { foo = "bar" }
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
+		{
+			name: "generate_file - invalid project_paths list element",
+			input: []cfgfile{
+				{
+					filename: "gen.tm",
+					body: `
+						generate_file "test.tf" {
+							stack_filter { project_paths = ["blah", 1] }
+							content = "foo"
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
+		{
+			name: "generate_hcl - invalid project_paths list element",
+			input: []cfgfile{
+				{
+					filename: "gen.tm",
+					body: `
+						generate_hcl "test.tf" {
+							stack_filter { project_paths = ["blah", 1] }
+							content { foo = "bar" }
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
+		{
+			name: "generate_file - invalid context",
+			input: []cfgfile{
+				{
+					filename: "gen.tm",
+					body: `
+						generate_file "test.tf" {
+							context = root
+							stack_filter { project_paths = ["blah"] }
+							content = "foo"
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
 	} {
 		testParser(t, tc)
 	}
@@ -792,7 +1324,7 @@ func TestHCLParserTerramateBlocksMerging(t *testing.T) {
 								DefaultBranch:    "trunk",
 								CheckUntracked:   true,
 								CheckUncommitted: true,
-								CheckRemote:      true,
+								CheckRemote:      hcl.CheckIsUnset,
 							},
 						},
 					},
@@ -847,7 +1379,7 @@ func TestHCLParserTerramateBlocksMerging(t *testing.T) {
 								DefaultBranch:    "trunk",
 								CheckUntracked:   true,
 								CheckUncommitted: true,
-								CheckRemote:      true,
+								CheckRemote:      hcl.CheckIsUnset,
 							},
 						},
 					},
@@ -886,6 +1418,63 @@ func TestHCLParserTerramateBlocksMerging(t *testing.T) {
 			want: want{
 				errs: []error{
 					errors.E(hcl.ErrTerramateSchema),
+				},
+			},
+		},
+		// Note: the testcases below also apply for "before", "wants", "wanted_by" and "watch" but
+		// only "after" is tested, because all of them have the same implementation.
+		// If this assumption is not correct anymore, please test them all individually here.
+		{
+			name: "regression check for stack.after without error ranges",
+			input: []cfgfile{
+				{
+					filename: "stack.tm",
+					body: `
+						stack {
+							after = 1
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema, Mkrange("stack.tm", Start(3, 16, 30), End(3, 17, 31))),
+				},
+			},
+		},
+		{
+			name: "regression check for stack.after with wrong element item and missing error ranges",
+			input: []cfgfile{
+				{
+					filename: "stack.tm",
+					body: `
+						stack {
+							after = [1]
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema, Mkrange("stack.tm", Start(3, 16, 30), End(3, 19, 33))),
+				},
+			},
+		},
+		{
+			name: "regression check for stack.after with duplicates and missing error ranges",
+			input: []cfgfile{
+				{
+					filename: "stack.tm",
+					body: `
+						stack {
+							after = ["A", "B", "dup", "dup", "C"]
+						}
+					`,
+				},
+			},
+			want: want{
+				errs: []error{
+					errors.E(hcl.ErrTerramateSchema, Mkrange("stack.tm", Start(3, 16, 30), End(3, 45, 59))),
 				},
 			},
 		},
@@ -959,7 +1548,8 @@ func TestHCLParserTerramateBlocksMerging(t *testing.T) {
 
 func testParser(t *testing.T, tc testcase) {
 	t.Run(tc.name, func(t *testing.T) {
-		configsDir := t.TempDir()
+		t.Parallel()
+		configsDir := test.TempDir(t)
 		for _, inputConfigFile := range tc.input {
 			if inputConfigFile.filename == "" {
 				panic("expect a filename in the input config")
@@ -1050,11 +1640,19 @@ func parse(tc testcase) (hcl.Config, error) {
 	if err != nil {
 		return hcl.Config{}, errors.E("adding files to parser", err)
 	}
+
+	if tc.loadExperimentsConfig {
+		rootcfg, err := hcl.ParseDir(tc.rootdir, tc.rootdir)
+		if err != nil {
+			return hcl.Config{}, errors.E("failed to load root config", err)
+		}
+		parser.Experiments = rootcfg.Experiments()
+	}
 	return parser.ParseConfig()
 }
 
 func TestHCLParseReParsingFails(t *testing.T) {
-	temp := t.TempDir()
+	temp := test.TempDir(t)
 	p, err := hcl.NewTerramateParser(temp, temp)
 	assert.NoError(t, err)
 	test.WriteFile(t, temp, "test.tm", `terramate {}`)
@@ -1070,7 +1668,7 @@ func TestHCLParseReParsingFails(t *testing.T) {
 }
 
 func TestHCLParseProvidesAllParsedBodies(t *testing.T) {
-	cfgdir := t.TempDir()
+	cfgdir := test.TempDir(t)
 	parser, err := hcl.NewTerramateParser(cfgdir, cfgdir)
 	assert.NoError(t, err)
 

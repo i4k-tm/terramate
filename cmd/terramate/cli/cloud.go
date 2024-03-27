@@ -5,6 +5,8 @@ package cli
 
 import (
 	"context"
+	stdjson "encoding/json"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -12,17 +14,26 @@ import (
 	"github.com/cli/go-gh/v2/pkg/auth"
 	"github.com/cli/go-gh/v2/pkg/repository"
 	"github.com/golang-jwt/jwt"
+	"github.com/google/go-github/v58/github"
+	"github.com/hashicorp/go-uuid"
 	"github.com/rs/zerolog/log"
+	githubql "github.com/shurcooL/githubv4"
 	"github.com/terramate-io/terramate/cloud"
 	"github.com/terramate-io/terramate/cloud/deployment"
-	"github.com/terramate-io/terramate/cmd/terramate/cli/github"
+	"github.com/terramate-io/terramate/cloud/drift"
+	"github.com/terramate-io/terramate/cloud/preview"
+	"github.com/terramate-io/terramate/cloud/stack"
+	"github.com/terramate-io/terramate/cmd/terramate/cli/clitest"
+	tmgithub "github.com/terramate-io/terramate/cmd/terramate/cli/github"
+	"golang.org/x/oauth2"
+
 	"github.com/terramate-io/terramate/cmd/terramate/cli/out"
 	"github.com/terramate-io/terramate/config"
 	"github.com/terramate-io/terramate/errors"
+	"github.com/terramate-io/terramate/git"
+	"github.com/terramate-io/terramate/printer"
+	prj "github.com/terramate-io/terramate/project"
 )
-
-// ErrOnboardingIncomplete indicates the onboarding process is incomplete.
-const ErrOnboardingIncomplete errors.Kind = "cloud commands cannot be used until onboarding is complete"
 
 const (
 	defaultCloudTimeout  = 60 * time.Second
@@ -30,23 +41,32 @@ const (
 	defaultGithubTimeout = defaultCloudTimeout
 )
 
-// DisablingCloudMessage is the message displayed in the warning when disabling
-// the cloud features. It's exported because it's checked in tests.
-const DisablingCloudMessage = "disabling the cloud features"
+const githubDomain = "github.com"
+
+const (
+	githubErrNotFound            errors.Kind = "resource not found (HTTP Status: 404)"
+	githubErrUnprocessableEntity errors.Kind = "entity cannot be processed (HTTP Status: 422)"
+)
+
+type cloudRunState struct {
+	runUUID cloud.UUID
+	orgName string
+	orgUUID cloud.UUID
+
+	stackMeta2ID map[string]int64
+	// stackPreviews is a map of stack.ID to stackPreview.ID
+	stackMeta2PreviewIDs map[string]string
+	reviewRequest        *cloud.ReviewRequest
+	prFromGHAEvent       *github.PullRequest
+	metadata             *cloud.DeploymentMetadata
+}
 
 type cloudConfig struct {
 	disabled bool
 	client   *cloud.Client
 	output   out.O
 
-	credential credential
-
-	run struct {
-		runUUID string
-		orgUUID string
-
-		meta2id map[string]int
-	}
+	run cloudRunState
 }
 
 type credential interface {
@@ -56,9 +76,11 @@ type credential interface {
 	Refresh() error
 	IsExpired() bool
 	ExpireAt() time.Time
-	Validate(cloudcfg cloudConfig) error
+
+	// private interface
+
 	organizations() cloud.MemberOrganizations
-	Info()
+	info(selectedOrgName string)
 }
 
 type keyValue struct {
@@ -66,10 +88,34 @@ type keyValue struct {
 	value string
 }
 
+func (rs *cloudRunState) setMeta2CloudID(metaID string, id int64) {
+	if rs.stackMeta2ID == nil {
+		rs.stackMeta2ID = make(map[string]int64)
+	}
+	rs.stackMeta2ID[strings.ToLower(metaID)] = id
+}
+
+func (rs cloudRunState) stackCloudID(metaID string) (int64, bool) {
+	id, ok := rs.stackMeta2ID[strings.ToLower(metaID)]
+	return id, ok
+}
+
+func (rs *cloudRunState) setMeta2PreviewID(metaID string, previewID string) {
+	if rs.stackMeta2PreviewIDs == nil {
+		rs.stackMeta2PreviewIDs = make(map[string]string)
+	}
+	rs.stackMeta2PreviewIDs[strings.ToLower(metaID)] = previewID
+}
+
+func (rs cloudRunState) cloudPreviewID(metaID string) (string, bool) {
+	id, ok := rs.stackMeta2PreviewIDs[strings.ToLower(metaID)]
+	return id, ok
+}
+
 func (c *cli) credentialPrecedence(output out.O) []credential {
 	return []credential{
-		newGithubOIDC(output),
-		newGoogleCredential(output, c.cloud.client.IDPKey, c.clicfg),
+		newGithubOIDC(output, c.cloud.client),
+		newGoogleCredential(output, c.cloud.client.IDPKey, c.clicfg, c.cloud.client),
 	}
 }
 
@@ -77,63 +123,104 @@ func (c *cli) cloudEnabled() bool {
 	return !c.cloud.disabled
 }
 
+func (c *cli) disableCloudFeatures(err error) {
+	log.Warn().Err(err).Msg(clitest.CloudDisablingMessage)
+
+	c.cloud.disabled = true
+}
+
+func (c *cli) handleCriticalError(err error) {
+	if err != nil {
+		if c.uimode == HumanMode {
+			fatal("aborting", err)
+		}
+
+		c.disableCloudFeatures(err)
+	}
+}
+
+func selectCloudStackTasks(runs []stackRun, pred func(stackRunTask) bool) []stackCloudRun {
+	var cloudRuns []stackCloudRun
+	for _, run := range runs {
+		for _, t := range run.Tasks {
+			if pred(t) {
+				cloudRuns = append(cloudRuns, stackCloudRun{
+					Stack: run.Stack,
+					Task:  t,
+				})
+				// Currently, only a single task per stackRun group may be selected.
+				break
+			}
+		}
+	}
+	return cloudRuns
+}
+
+func isDeploymentTask(t stackRunTask) bool { return t.CloudSyncDeployment }
+func isDriftTask(t stackRunTask) bool      { return t.CloudSyncDriftStatus }
+func isPreviewTask(t stackRunTask) bool    { return t.CloudSyncPreview }
+
 func (c *cli) checkCloudSync() {
-	if !c.parsedArgs.Run.CloudSyncDeployment && !c.parsedArgs.Run.CloudSyncDriftStatus {
+	if !c.parsedArgs.Run.CloudSyncDeployment && !c.parsedArgs.Run.CloudSyncDriftStatus && !c.parsedArgs.Run.CloudSyncPreview {
 		return
 	}
 
 	err := c.setupCloudConfig()
-	if err != nil {
-		log.Warn().Err(errors.E(err, "failed to check if credentials work")).
-			Msg(DisablingCloudMessage)
-
-		c.cloud.disabled = true
-	}
+	c.handleCriticalError(err)
 
 	if c.cloud.disabled {
 		return
 	}
 
 	if c.parsedArgs.Run.CloudSyncDeployment {
-		c.cloud.run.meta2id = make(map[string]int)
-		c.cloud.run.runUUID, err = generateRunID()
-		if err != nil {
-			fatal(err, "generating run uuid")
-		}
+		uuid, err := uuid.GenerateUUID()
+		c.handleCriticalError(err)
+		c.cloud.run.runUUID = cloud.UUID(uuid)
 	}
 }
 
-func (c *cli) setupCloudConfig() error {
-	c.cloud = cloudConfig{
-		client: &cloud.Client{
-			BaseURL:    cloudBaseURL(),
-			IDPKey:     idpkey(),
-			HTTPClient: &c.httpClient,
-		},
-		output: c.output,
-	}
-	cred, err := c.loadCredential()
-	if err != nil {
-		return err
+func (c *cli) cloudOrgName() string {
+	orgName := os.Getenv("TM_CLOUD_ORGANIZATION")
+	if orgName != "" {
+		return orgName
 	}
 
-	c.cloud.credential = cred
-	c.cloud.client.Credential = cred
-	err = cred.Validate(c.cloud)
+	cfg := c.rootNode()
+	if cfg.Terramate != nil &&
+		cfg.Terramate.Config != nil &&
+		cfg.Terramate.Config.Cloud != nil {
+		return cfg.Terramate.Config.Cloud.Organization
+	}
+
+	return ""
+}
+
+func (c *cli) setupCloudConfig() error {
+	err := c.loadCredential()
 	if err != nil {
-		return err
+		printer.Stderr.ErrorWithDetails("failed to load the cloud credentials", err)
+		return cloudError()
 	}
 
 	// at this point we know user is onboarded, ie has at least 1 organization.
 	orgs := c.cred().organizations()
 
-	useOrgName := os.Getenv("TM_CLOUD_ORGANIZATION")
+	useOrgName := c.cloudOrgName()
+	c.cloud.run.orgName = useOrgName
 	if useOrgName != "" {
-		var useOrgUUID string
+		var useOrgUUID cloud.UUID
 		for _, org := range orgs {
-			if org.Name == useOrgName {
+			if strings.EqualFold(org.Name, useOrgName) {
 				if org.Status != "active" && org.Status != "trusted" {
-					fatal(errors.E("You are not yet an active member of organization %s. Please accept the invitation first.", useOrgName))
+					printer.Stderr.ErrorWithDetails(
+						"Invalid membership status",
+						errors.E(
+							"You are not yet an active member of organization %s. Please accept the invitation first.",
+							useOrgName,
+						),
+					)
+
+					return cloudError()
 				}
 
 				useOrgUUID = org.UUID
@@ -142,247 +229,786 @@ func (c *cli) setupCloudConfig() error {
 		}
 
 		if useOrgUUID == "" {
-			fatal(errors.E("You are not a member of organization %q or the organization does not exist. Available organizations: %s",
-				useOrgName,
-				orgs,
-			))
+			printer.Stderr.ErrorWithDetails(
+				"Invalid membership status",
+				errors.E(
+					"You are not a member of organization %q or the organization does not exist. Available organizations: %s",
+					useOrgName,
+					orgs,
+				),
+			)
+
+			return cloudError()
 		}
 
 		c.cloud.run.orgUUID = useOrgUUID
-	} else if len(orgs) != 1 {
-		fatal(
-			errors.E("Please set TM_CLOUD_ORGANIZATION environment variable to a specific available organization: %s", orgs),
-		)
 	} else {
-		org := orgs[0]
-		if org.Status != "active" && org.Status != "trusted" {
-			fatal(errors.E("You are not yet an active member of organization %s. Please accept the invitation first.", org.Name))
+		var activeOrgs cloud.MemberOrganizations
+		var invitedOrgs cloud.MemberOrganizations
+		for _, org := range orgs {
+			if org.Status == "active" || org.Status == "trusted" {
+				activeOrgs = append(activeOrgs, org)
+			} else if org.Status == "invited" {
+				invitedOrgs = append(invitedOrgs, org)
+			}
 		}
-		c.cloud.run.orgUUID = org.UUID
-	}
+		if len(activeOrgs) == 0 {
+			printer.Stderr.Error(clitest.CloudNoMembershipMessage)
 
+			if len(invitedOrgs) > 0 {
+				printer.Stderr.WarnWithDetails(
+					"Pending invitation",
+					errors.E(
+						"You have pending invitation for the following organizations: %s",
+						invitedOrgs,
+					),
+				)
+			}
+
+			return errors.E(clitest.ErrCloudOnboardingIncomplete)
+		}
+		if len(activeOrgs) > 1 {
+			printer.Stderr.ErrorWithDetails(
+				"Invalid cloud configuration",
+				errors.E("Please set TM_CLOUD_ORGANIZATION environment variable or "+
+					"terramate.config.cloud.organization configuration attribute to a specific available organization: %s",
+					activeOrgs,
+				),
+			)
+			return cloudError()
+		}
+
+		c.cloud.run.orgName = activeOrgs[0].Name
+		c.cloud.run.orgUUID = activeOrgs[0].UUID
+	}
 	return nil
 }
 
-func (c *cli) cloudSyncBefore(s *config.Stack, _ string) {
-	if !c.cloudEnabled() || !c.parsedArgs.Run.CloudSyncDeployment {
-		return
-	}
-	c.doCloudSyncDeployment(s, deployment.Running)
-}
-
-func (c *cli) cloudSyncAfter(s *config.Stack, exitCode int, err error) {
-	if !c.cloudEnabled() || !c.isCloudSync() {
+func (c *cli) cloudSyncBefore(run stackCloudRun) {
+	if !c.cloudEnabled() {
 		return
 	}
 
-	if c.parsedArgs.Run.CloudSyncDeployment {
-		c.cloudSyncDeployment(s, err)
-	} else {
-		c.cloudSyncDriftStatus(s, exitCode, err)
+	if run.Task.CloudSyncDeployment {
+		c.doCloudSyncDeployment(run, deployment.Running)
+	}
+
+	if run.Task.CloudSyncPreview {
+		c.doPreviewBefore(run)
 	}
 }
 
-func (c *cli) cloudSyncCancelStacks(stacks []ExecContext) {
-	for _, run := range stacks {
-		c.cloudSyncAfter(run.Stack, -1, errors.E(ErrRunCanceled))
+func (c *cli) cloudSyncAfter(run stackCloudRun, res runResult, err error) {
+	if !c.cloudEnabled() {
+		return
+	}
+
+	if run.Task.CloudSyncDeployment {
+		c.cloudSyncDeployment(run, err)
+	}
+
+	if run.Task.CloudSyncDriftStatus {
+		c.cloudSyncDriftStatus(run, res, err)
+	}
+
+	if run.Task.CloudSyncPreview {
+		c.doPreviewAfter(run, res)
+	}
+}
+
+func (c *cli) doPreviewBefore(run stackCloudRun) {
+	stackPreviewID, ok := c.cloud.run.cloudPreviewID(run.Stack.ID)
+	if !ok {
+		c.disableCloudFeatures(errors.E(errors.ErrInternal, "failed to get previewID"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+	if err := c.cloud.client.UpdateStackPreview(ctx,
+		cloud.UpdateStackPreviewOpts{
+			OrgUUID:          c.cloud.run.orgUUID,
+			StackPreviewID:   stackPreviewID,
+			Status:           preview.StackStatusRunning,
+			ChangesetDetails: nil,
+		}); err != nil {
+		printer.Stderr.ErrorWithDetails("failed to update stack preview", err)
+		return
+	}
+	log.Debug().
+		Str("stack_name", run.Stack.Dir.String()).
+		Str("stack_preview_status", preview.StackStatusRunning.String()).
+		Msg("Setting stack preview status")
+}
+
+func (c *cli) doPreviewAfter(run stackCloudRun, res runResult) {
+	planfile := run.Task.CloudSyncTerraformPlanFile
+
+	previewStatus := preview.DerivePreviewStatus(res.ExitCode)
+	var previewChangeset *cloud.ChangesetDetails
+	if planfile != "" && previewStatus != preview.StackStatusCanceled {
+		changeset, err := c.getTerraformChangeset(run, planfile)
+		if err != nil || changeset == nil {
+			printer.Stderr.WarnWithDetails(
+				sprintf("skipping terraform plan sync for %s", run.Stack.Dir.String()),
+				err)
+
+			if previewStatus != preview.StackStatusFailed {
+				printer.Stderr.Warn(
+					sprintf("preview status set to \"failed\" (previously %q) due to failure when generating the "+
+						"changeset details", previewStatus),
+				)
+
+				previewStatus = preview.StackStatusFailed
+			}
+		}
+		if changeset != nil {
+			previewChangeset = &cloud.ChangesetDetails{
+				Provisioner:    changeset.Provisioner,
+				ChangesetASCII: changeset.ChangesetASCII,
+				ChangesetJSON:  changeset.ChangesetJSON,
+			}
+		}
+	}
+
+	stackPreviewID, ok := c.cloud.run.cloudPreviewID(run.Stack.ID)
+	if !ok {
+		c.disableCloudFeatures(errors.E(errors.ErrInternal, "failed to get previewID"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+	if err := c.cloud.client.UpdateStackPreview(ctx,
+		cloud.UpdateStackPreviewOpts{
+			OrgUUID:          c.cloud.run.orgUUID,
+			StackPreviewID:   stackPreviewID,
+			Status:           previewStatus,
+			ChangesetDetails: previewChangeset,
+		}); err != nil {
+		printer.Stderr.ErrorWithDetails("failed to create stack preview", err)
+		return
+	}
+
+	logger := log.With().
+		Str("stack_name", run.Stack.Dir.String()).
+		Str("stack_preview_status", previewStatus.String()).
+		Logger()
+
+	logger.Debug().Msg("Setting stack preview status")
+	if previewChangeset != nil {
+		logger.Debug().Msg("Sending changelog")
 	}
 }
 
 func (c *cli) cloudInfo() {
-	err := c.setupCloudConfig()
+	err := c.loadCredential()
 	if err != nil {
-		fatal(err)
+		fatal("failed to load credentials", err)
 	}
-	c.cred().Info()
+	c.cred().info(c.cloudOrgName())
+
 	// verbose info
 	c.cloud.output.MsgStdOutV("next token refresh in: %s", time.Until(c.cred().ExpireAt()))
 }
 
-func (c *cli) tryGithubMetadata() (*cloud.DeploymentReviewRequest, *cloud.DeploymentMetadata, string) {
+func (c *cli) cloudDriftShow() {
+	err := c.setupCloudConfig()
+	if err != nil {
+		fatal("unable to setup cloud configuration", err)
+	}
+	st, found, err := config.TryLoadStack(c.cfg(), prj.PrjAbsPath(c.rootdir(), c.wd()))
+	if err != nil {
+		fatal("loading stack in current directory", err)
+	}
+	if !found {
+		fatal("No stack selected. Please enter a stack to show a potential drift.", nil)
+	}
+	if st.ID == "" {
+		fatal("The stack must have an ID for using TMC features", nil)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+
+	stackResp, found, err := c.cloud.client.GetStack(ctx, c.cloud.run.orgUUID, c.prj.prettyRepo(), st.ID)
+	if err != nil {
+		fatal("unable to fetch stack", err)
+	}
+	if !found {
+		fatal(sprintf("Stack %s was not yet synced with the Terramate Cloud.", st.Dir.String()), nil)
+	}
+
+	if stackResp.Status != stack.Drifted && stackResp.DriftStatus != drift.Drifted {
+		c.output.MsgStdOut("Stack %s is not drifted.", st.Dir.String())
+		return
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+
+	// stack is drifted
+	driftsResp, err := c.cloud.client.StackLastDrift(ctx, c.cloud.run.orgUUID, stackResp.ID)
+	if err != nil {
+		fatal("unable to fetch drift", err)
+	}
+	if len(driftsResp.Drifts) == 0 {
+		fatal(sprintf("Stack %s is drifted, but no details are available.", st.Dir.String()), nil)
+	}
+	driftData := driftsResp.Drifts[0]
+
+	ctx, cancel = context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+	driftData, err = c.cloud.client.DriftDetails(ctx, c.cloud.run.orgUUID, stackResp.ID, driftData.ID)
+	if err != nil {
+		fatal("unable to fetch drift details", err)
+	}
+	if driftData.Status != drift.Drifted || driftData.Details == nil || driftData.Details.Provisioner == "" {
+		fatal(sprintf("Stack %s is drifted, but no details are available.", st.Dir.String()), nil)
+	}
+	c.output.MsgStdOutV("drift provisioner: %s", driftData.Details.Provisioner)
+	c.output.MsgStdOut(driftData.Details.ChangesetASCII)
+}
+
+func (c *cli) detectCloudMetadata() {
 	logger := log.With().
 		Str("normalized_repository", c.prj.prettyRepo()).
 		Str("head_commit", c.prj.headCommit()).
 		Logger()
 
-	r, err := repository.Parse(c.prj.prettyRepo())
+	prettyRepo := c.prj.prettyRepo()
+	if prettyRepo == "local" {
+
+		logger.Debug().Msg("skipping review_request and remote metadata for local repository")
+		return
+	}
+
+	headCommit := c.prj.headCommit()
+
+	c.cloud.run.metadata = &cloud.DeploymentMetadata{}
+	c.cloud.run.metadata.GitCommitSHA = headCommit
+
+	md := c.cloud.run.metadata
+
+	defer func() {
+		if c.cloud.run.metadata != nil {
+			data, err := stdjson.Marshal(c.cloud.run.metadata)
+			if err == nil {
+				logger.Debug().RawJSON("provider_metadata", data).Msg("detected metadata")
+			} else {
+				logger.Warn().Err(err).Msg("failed to encode deployment metadata")
+			}
+		} else {
+			logger.Debug().Msg("no provider metadata detected")
+		}
+	}()
+
+	if commit, err := c.prj.git.wrapper.ShowCommitMetadata("HEAD"); err == nil {
+		setDefaultGitMetadata(md, commit)
+	} else {
+		logger.Warn().
+			Err(err).
+			Msg("failed to retrieve commit information from GitHub API")
+	}
+
+	r, err := repository.Parse(prettyRepo)
 	if err != nil {
 		logger.Debug().
 			Msg("repository cannot be normalized: skipping pull request retrievals for commit")
 
-		return nil, nil, ""
+		return
 	}
 
-	if r.Host != github.Domain {
-		return nil, nil, ""
+	githubAPIURL := os.Getenv("TM_GITHUB_API_URL")
+	if r.Host != githubDomain && githubAPIURL == "" {
+		return
 	}
+
+	setGithubActionsMetadata(md)
 
 	ghRepo := r.Owner + "/" + r.Name
 
-	logger = logger.With().
-		Str("github_repository", ghRepo).
-		Logger()
+	logger = logger.With().Str("github_repository", ghRepo).Logger()
+
+	// HTTP Client
+	githubClient := github.NewClient(&c.httpClient)
+	if githubAPIURL != "" {
+		githubBaseURL, err := url.Parse(githubAPIURL)
+		if err != nil {
+			logger.Error().Err(err).Msg("failed to parse github api url")
+			return
+		}
+		githubClient.BaseURL = githubBaseURL
+	}
 
 	ghToken, tokenSource := auth.TokenForHost(r.Host)
 
 	if ghToken != "" {
 		logger.Debug().Msgf("GitHub token obtained from %s", tokenSource)
+		githubClient = githubClient.WithAuthToken(ghToken)
 	}
 
-	ghClient := github.Client{
-		BaseURL:    os.Getenv("GITHUB_API_URL"),
-		HTTPClient: &c.httpClient,
-		Token:      ghToken,
+	// GraphQL CLient
+	var githubQLClient *githubql.Client
+	if ghToken != "" {
+		httpClient := oauth2.NewClient(
+			context.Background(),
+			oauth2.StaticTokenSource(
+				&oauth2.Token{AccessToken: ghToken},
+			))
+
+		githubQLClient = githubql.NewClient(httpClient)
+	} else {
+		githubQLClient = githubql.NewClient(&c.httpClient)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
-	defer cancel()
+	if ghCommit, err := getGithubCommit(githubClient, r.Owner, r.Name, headCommit); err == nil {
+		setGithubCommitMetadata(md, ghCommit)
+	} else {
+		logger.Warn().
+			Err(err).
+			Msg("failed to retrieve commit information from GitHub API")
+	}
 
-	headCommit := c.prj.headCommit()
-	pulls, err := ghClient.PullsForCommit(ctx, ghRepo, headCommit)
+	var prNumber int
+	prFromEvent, err := tmgithub.GetEventPR()
 	if err != nil {
-		if errors.IsKind(err, github.ErrNotFound) {
+		logger.Debug().Err(err).Msg("unable to get pull_request details from GITHUB_EVENT_PATH")
+	} else {
+		logger.Debug().Err(err).Msg("got pull_request details from GITHUB_EVENT_PATH")
+		c.cloud.run.prFromGHAEvent = prFromEvent
+		prNumber = prFromEvent.GetNumber()
+	}
+
+	pull, err := getGithubPRByNumberOrCommit(githubClient, ghToken, r.Owner, r.Name, prNumber, headCommit)
+	if err != nil {
+
+		logger.Debug().Err(err).
+			Int("number", prNumber).
+			Msg("failed to retrieve pull_request")
+		return
+	}
+
+	logger.Debug().
+		Str("pull_request_url", pull.GetHTMLURL()).
+		Msg("using pull request url")
+
+	setGithubPRMetadata(md, pull)
+
+	reviews, err := listGithubPullReviews(githubClient, r.Owner, r.Name, pull.GetNumber())
+	if err != nil {
+		logger.Warn().
+			Err(err).
+			Msg("failed to retrieve PR reviews")
+	}
+
+	checks, err := listGithubChecks(githubClient, r.Owner, r.Name, headCommit)
+	if err != nil {
+		logger.Warn().Err(err).Msg("failed to retrieve PR reviews")
+	}
+
+	merged := false
+	if pull.GetState() == "closed" {
+		merged, err = isGithubPRMerged(githubClient, r.Owner, r.Name, pull.GetNumber())
+		if err != nil {
+			logger.Warn().Err(err).Msg("failed to retrieve PR merged status")
+		}
+	}
+
+	reviewDecision, err := getGithubPRReviewDecision(githubQLClient, r.Owner, r.Name, pull.GetNumber())
+	if err != nil {
+		logger.Warn().Err(err).Msg("failed to retrieve review decision")
+	}
+
+	c.cloud.run.reviewRequest = c.newReviewRequest(pull, reviews, checks, merged, reviewDecision)
+}
+
+func getGithubPRByNumberOrCommit(githubClient *github.Client, ghToken, owner, repo string, number int, commit string) (*github.PullRequest, error) {
+	logger := log.With().
+		Str("github_repository", owner+"/"+repo).
+		Str("commit", commit).
+		Logger()
+
+	if number != 0 {
+		// fetch by number
+		pull, err := getGithubPRByNumber(githubClient, owner, repo, number)
+		if err != nil {
+			return nil, err
+		}
+		return pull, nil
+	}
+
+	// fetch by commit
+	pull, found, err := getGithubPRByCommit(githubClient, owner, repo, commit)
+	if err != nil {
+		if errors.IsKind(err, githubErrNotFound) {
 			if ghToken == "" {
 				logger.Warn().Msg("The GITHUB_TOKEN environment variable needs to be exported for private repositories.")
 			} else {
 				logger.Warn().Msg("The provided GitHub token does not have permission to read this repository or it does not exists.")
 			}
-			return nil, nil, ghRepo
-		}
-
-		if errors.IsKind(err, github.ErrUnprocessableEntity) {
+		} else if errors.IsKind(err, githubErrUnprocessableEntity) {
 			logger.Warn().
 				Msg("The HEAD commit cannot be found in the remote. Did you forget to push?")
-
-			return nil, nil, ghRepo
+		} else {
+			logger.Warn().
+				Err(err).
+				Msg("failed to retrieve pull requests associated with HEAD")
 		}
-
-		logger.Warn().
-			Err(err).
-			Msg("failed to retrieve pull requests associated with HEAD")
+		return nil, err
+	}
+	if !found {
+		logger.Warn().Msg("no pull request associated with HEAD commit")
+		return nil, err
 	}
 
-	for _, pull := range pulls {
-		logger.Debug().
-			Str("pull_request_url", pull.HTMLURL).
-			Msg("found pull request")
-	}
+	return pull, nil
+}
 
-	metadata := &cloud.DeploymentMetadata{
-		Platform:              "github",
-		DeploymentTriggeredBy: os.Getenv("GITHUB_ACTOR"),
-		DeploymentBranch:      os.Getenv("GITHUB_REF_NAME"),
-		DeploymentCommitSHA:   headCommit,
-	}
-
-	ctx, cancel = context.WithTimeout(context.Background(), defaultGithubTimeout)
+func getGithubCommit(ghClient *github.Client, owner, repo, commit string) (*github.RepositoryCommit, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
 	defer cancel()
 
-	commit, err := ghClient.Commit(ctx, ghRepo, headCommit)
+	rcommit, _, err := ghClient.Repositories.GetCommit(ctx, owner, repo, commit, nil)
 	if err != nil {
-		logger.Warn().
-			Err(err).
-			Msg("failed to retrieve commit information from GitHub API")
-	} else {
-		isVerified := commit.Verification.Verified
-		metadata.DeploymentCommitVerified = &isVerified
-		metadata.DeploymentCommitVerifiedReason = commit.Verification.Reason
+		return nil, err
+	}
 
-		message := commit.Commit.Message
-		messageParts := strings.Split(message, "\n")
-		metadata.DeploymentCommitTitle = messageParts[0]
-		if len(messageParts) > 1 {
-			metadata.DeploymentCommitDescription = strings.Join(messageParts[1:], "\n")
+	return rcommit, nil
+}
+
+func getGithubPRByNumber(ghClient *github.Client, owner string, repo string, number int) (*github.PullRequest, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	pull, _, err := ghClient.PullRequests.Get(ctx, owner, repo, number)
+	if err != nil {
+		return nil, err
+	}
+
+	return pull, nil
+
+}
+
+// returns nil, nil if there was no PR associated with commit
+func getGithubPRByCommit(ghClient *github.Client, owner, repo, commit string) (*github.PullRequest, bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	opt := &github.ListOptions{PerPage: 1}
+
+	pulls, _, err := ghClient.PullRequests.ListPullRequestsWithCommit(ctx, owner, repo, commit, opt)
+	if err != nil {
+		return nil, true, err
+	}
+	if len(pulls) == 0 {
+		return nil, false, nil
+	}
+
+	return pulls[0], true, nil
+
+}
+
+func getGithubPRReviewDecision(qlClient *githubql.Client, owner, repo string, pullNumber int) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	var q struct {
+		Repository struct {
+			PullRequest struct {
+				ReviewDecision string
+			} `graphql:"pullRequest(number: $pr_number)"`
+			Description string
+		} `graphql:"repository(owner: $repo_owner, name: $repo_name)"`
+	}
+
+	vars := map[string]interface{}{
+		"repo_owner": githubql.String(owner),
+		"repo_name":  githubql.String(repo),
+		"pr_number":  githubql.Int(pullNumber),
+	}
+
+	err := qlClient.Query(ctx, &q, vars)
+	if err != nil {
+		return "", err
+	}
+	r := q.Repository.PullRequest.ReviewDecision
+	if r == "" {
+		return "none", nil
+	}
+	return strings.ToLower(r), nil
+
+}
+
+func isGithubPRMerged(ghClient *github.Client, owner, repo string, pullNumber int) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	isMerged, _, err := ghClient.PullRequests.IsMerged(ctx, owner, repo, pullNumber)
+	return isMerged, err
+}
+
+func listGithubPullReviews(ghClient *github.Client, owner, repo string, pullNumber int) ([]*github.PullRequestReview, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	opt := &github.ListOptions{PerPage: 100}
+
+	var allReviews []*github.PullRequestReview
+	for {
+		reviews, resp, err := ghClient.PullRequests.ListReviews(ctx, owner, repo, pullNumber, nil)
+		if err != nil {
+			return nil, err
+		}
+		allReviews = append(allReviews, reviews...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return allReviews, nil
+}
+
+func listGithubChecks(ghClient *github.Client, owner, repo string, commit string) ([]*github.CheckRun, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultGithubTimeout)
+	defer cancel()
+
+	opt := &github.ListOptions{PerPage: 100}
+
+	var allChecks []*github.CheckRun
+	for {
+		checksResponse, resp, err := ghClient.Checks.ListCheckRunsForRef(ctx, owner, repo, commit, nil)
+		if err != nil {
+			return nil, err
+		}
+		allChecks = append(allChecks, checksResponse.CheckRuns...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opt.Page = resp.NextPage
+	}
+
+	return allChecks, nil
+}
+
+func setDefaultGitMetadata(md *cloud.DeploymentMetadata, commit *git.CommitMetadata) {
+	md.GitCommitAuthorName = commit.Author
+	md.GitCommitAuthorEmail = commit.Email
+	md.GitCommitAuthorTime = commit.Time
+	md.GitCommitTitle = commit.Subject
+	md.GitCommitDescription = commit.Body
+}
+
+func setGithubActionsMetadata(md *cloud.DeploymentMetadata) {
+	md.GithubActionsDeploymentTriggeredBy = os.Getenv("GITHUB_ACTOR")
+	md.GithubActionsDeploymentBranch = os.Getenv("GITHUB_REF_NAME")
+	md.GithubActionsRunID = os.Getenv("GITHUB_RUN_ID")
+	md.GithubActionsRunAttempt = os.Getenv("GITHUB_RUN_ATTEMPT")
+	md.GithubActionsWorkflowName = os.Getenv("GITHUB_WORKFLOW")
+	md.GithubActionsWorkflowRef = os.Getenv("GITHUB_WORKFLOW_REF")
+}
+
+func setGithubCommitMetadata(md *cloud.DeploymentMetadata, commit *github.RepositoryCommit) {
+	isVerified := commit.Commit.GetVerification().GetVerified()
+
+	md.GithubCommitVerified = &isVerified
+	md.GithubCommitVerifiedReason = commit.Commit.GetVerification().GetReason()
+
+	message := commit.GetCommit().GetMessage()
+	messageParts := strings.Split(message, "\n")
+	md.GithubCommitTitle = messageParts[0]
+	if len(messageParts) > 1 {
+		md.GithubCommitDescription = strings.TrimSpace(strings.Join(messageParts[1:], "\n"))
+	}
+
+	md.GithubCommitAuthorLogin = commit.GetAuthor().GetLogin()
+	md.GithubCommitAuthorAvatarURL = commit.GetAuthor().GetAvatarURL()
+	md.GithubCommitAuthorGravatarID = commit.GetAuthor().GetGravatarID()
+
+	md.GithubCommitAuthorGitName = commit.GetCommit().GetAuthor().GetName()
+	md.GithubCommitAuthorGitEmail = commit.GetCommit().GetAuthor().GetEmail()
+	authorDate := commit.GetCommit().GetAuthor().GetDate()
+	md.GithubCommitAuthorGitDate = authorDate.GetTime()
+
+	md.GithubCommitCommitterLogin = commit.GetCommitter().GetLogin()
+	md.GithubCommitCommitterAvatarURL = commit.GetCommitter().GetAvatarURL()
+	md.GithubCommitCommitterGravatarID = commit.GetCommitter().GetGravatarID()
+
+	md.GithubCommitCommitterGitName = commit.GetCommit().GetCommitter().GetName()
+	md.GithubCommitCommitterGitEmail = commit.GetCommit().GetCommitter().GetEmail()
+	commiterDate := commit.GetCommit().GetCommitter().GetDate()
+	md.GithubCommitCommitterGitDate = commiterDate.GetTime()
+}
+
+func setGithubPRMetadata(md *cloud.DeploymentMetadata, pull *github.PullRequest) {
+	md.GithubPullRequestURL = pull.GetHTMLURL()
+	md.GithubPullRequestNumber = pull.GetNumber()
+	md.GithubPullRequestTitle = pull.GetTitle()
+	md.GithubPullRequestDescription = pull.GetBody()
+	md.GithubPullRequestState = pull.GetState()
+	md.GithubPullRequestMergeCommitSHA = pull.GetMergeCommitSHA()
+	md.GithubPullRequestHeadLabel = pull.GetHead().GetLabel()
+	md.GithubPullRequestHeadRef = pull.GetHead().GetRef()
+	md.GithubPullRequestHeadSHA = pull.GetHead().GetSHA()
+	md.GithubPullRequestHeadAuthorLogin = pull.GetHead().GetUser().GetLogin()
+	md.GithubPullRequestHeadAuthorAvatarURL = pull.GetHead().GetUser().GetAvatarURL()
+	md.GithubPullRequestHeadAuthorGravatarID = pull.GetHead().GetUser().GetGravatarID()
+	createdAt := pull.GetCreatedAt()
+	updatedAt := pull.GetUpdatedAt()
+	md.GithubPullRequestCreatedAt = createdAt.GetTime()
+	md.GithubPullRequestUpdatedAt = updatedAt.GetTime()
+	md.GithubPullRequestClosedAt = pull.ClosedAt.GetTime()
+	md.GithubPullRequestMergedAt = pull.MergedAt.GetTime()
+
+	md.GithubPullRequestBaseLabel = pull.GetBase().GetLabel()
+	md.GithubPullRequestBaseRef = pull.GetBase().GetRef()
+	md.GithubPullRequestBaseSHA = pull.GetBase().GetSHA()
+	md.GithubPullRequestBaseAuthorLogin = pull.GetBase().GetUser().GetLogin()
+	md.GithubPullRequestBaseAuthorAvatarURL = pull.GetBase().GetUser().GetAvatarURL()
+	md.GithubPullRequestBaseAuthorGravatarID = pull.GetBase().GetUser().GetGravatarID()
+
+	md.GithubPullRequestAuthorLogin = pull.GetUser().GetLogin()
+	md.GithubPullRequestAuthorAvatarURL = pull.GetUser().GetAvatarURL()
+	md.GithubPullRequestAuthorGravatarID = pull.GetUser().GetGravatarID()
+}
+
+func (c *cli) newReviewRequest(
+	pull *github.PullRequest,
+	reviews []*github.PullRequestReview,
+	checks []*github.CheckRun,
+	merged bool,
+	reviewDecision string,
+) *cloud.ReviewRequest {
+	pullUpdatedAt := pull.GetUpdatedAt()
+	rr := &cloud.ReviewRequest{
+		Platform:       "github",
+		Repository:     c.prj.prettyRepo(),
+		URL:            pull.GetHTMLURL(),
+		Number:         pull.GetNumber(),
+		Title:          pull.GetTitle(),
+		Description:    pull.GetBody(),
+		CommitSHA:      pull.GetHead().GetSHA(),
+		Draft:          pull.GetDraft(),
+		ReviewDecision: reviewDecision,
+		UpdatedAt:      pullUpdatedAt.GetTime(),
+	}
+
+	prFromEvent := c.cloud.run.prFromGHAEvent
+	if prFromEvent.GetHead() != nil && prFromEvent.GetHead().GetRepo() != nil {
+		pushedAt := prFromEvent.GetHead().GetRepo().GetPushedAt()
+		rr.PushedAt = pushedAt.GetTime()
+	}
+
+	if pull.GetState() == "closed" {
+		if merged {
+			rr.Status = "merged"
+		} else {
+			rr.Status = "closed"
+		}
+	} else {
+		rr.Status = "open"
+	}
+
+	for _, l := range pull.Labels {
+		rr.Labels = append(rr.Labels, cloud.Label{
+			Name:        l.GetName(),
+			Color:       l.GetColor(),
+			Description: l.GetDescription(),
+		})
+	}
+
+	uniqueReviewers := make(map[string]struct{})
+
+	for _, review := range reviews {
+		if review.GetState() == "CHANGES_REQUESTED" {
+			rr.ChangesRequestedCount++
+		} else if review.GetState() == "APPROVED" {
+			rr.ApprovedCount++
 		}
 
-		metadata.DeploymentCommitAuthorLogin = commit.Author.Login
-		metadata.DeploymentCommitAuthorAvatarURL = commit.Author.AvatarURL
-		metadata.DeploymentCommitAuthorGravatarID = commit.Author.GravatarID
+		login := review.GetUser().GetLogin()
 
-		metadata.DeploymentCommitAuthorGitName = commit.Commit.Author.Name
-		metadata.DeploymentCommitAuthorGitEmail = commit.Commit.Author.Email
-		metadata.DeploymentCommitAuthorGitDate = commit.Commit.Author.Date
+		if _, found := uniqueReviewers[login]; found {
+			continue
+		}
+		uniqueReviewers[login] = struct{}{}
 
-		metadata.DeploymentCommitCommitterLogin = commit.Committer.Login
-		metadata.DeploymentCommitCommitterAvatarURL = commit.Committer.AvatarURL
-		metadata.DeploymentCommitCommitterGravatarID = commit.Committer.GravatarID
-
-		metadata.DeploymentCommitCommitterGitName = commit.Commit.Committer.Name
-		metadata.DeploymentCommitCommitterGitEmail = commit.Commit.Committer.Email
-		metadata.DeploymentCommitCommitterGitDate = commit.Commit.Committer.Date
+		rr.Reviewers = append(rr.Reviewers, cloud.Reviewer{
+			Login:     login,
+			AvatarURL: review.GetUser().GetAvatarURL(),
+		})
 	}
 
-	if len(pulls) == 0 {
-		logger.Warn().
-			Msg("no pull request associated with HEAD commit")
-
-		return nil, metadata, ghRepo
+	rr.ChecksTotalCount = len(checks)
+	for _, check := range checks {
+		switch check.GetConclusion() {
+		case "success":
+			rr.ChecksSuccessCount++
+		case "failure":
+			rr.ChecksFailureCount++
+		}
 	}
 
-	pull := pulls[0]
-
-	logger.Debug().
-		Str("pull_request_url", pull.HTMLURL).
-		Msg("using pull request url")
-
-	reviewRequest := &cloud.DeploymentReviewRequest{
-		Platform:    "github",
-		Repository:  c.prj.prettyRepo(),
-		URL:         pull.HTMLURL,
-		Number:      pull.Number,
-		Title:       pull.Title,
-		Description: pull.Body,
-		CommitSHA:   pull.Head.SHA,
-	}
-
-	metadata.PullRequestAuthorLogin = pull.User.Login
-	metadata.PullRequestAuthorAvatarURL = pull.User.AvatarURL
-	metadata.PullRequestAuthorGravatarID = pull.User.GravatarID
-	metadata.PullRequestHeadLabel = pull.Head.Label
-	metadata.PullRequestHeadRef = pull.Head.Ref
-	metadata.PullRequestHeadSHA = pull.Head.SHA
-	metadata.PullRequestHeadAuthorLogin = pull.Head.User.Login
-	metadata.PullRequestHeadAuthorAvatarURL = pull.Head.User.AvatarURL
-	metadata.PullRequestHeadAuthorGravatarID = pull.Head.User.GravatarID
-
-	metadata.PullRequestBaseLabel = pull.Base.Label
-	metadata.PullRequestBaseRef = pull.Base.Ref
-	metadata.PullRequestBaseSHA = pull.Base.SHA
-	metadata.PullRequestBaseAuthorLogin = pull.Base.User.Login
-	metadata.PullRequestBaseAuthorAvatarURL = pull.Base.User.AvatarURL
-	metadata.PullRequestBaseAuthorGravatarID = pull.Base.User.GravatarID
-
-	metadata.PullRequestCreatedAt = pull.CreatedAt
-	metadata.PullRequestUpdatedAt = pull.UpdatedAt
-	metadata.PullRequestClosedAt = pull.ClosedAt
-	metadata.PullRequestMergedAt = pull.MergedAt
-	return reviewRequest, metadata, ghToken
+	return rr
 }
 
-func (c *cli) isCloudSync() bool {
-	return c.parsedArgs.Run.CloudSyncDeployment || c.parsedArgs.Run.CloudSyncDriftStatus
-}
+func (c *cli) loadCredential() error {
+	cloudURL := cloudBaseURL()
+	clientLogger := log.With().
+		Str("tmc_url", cloudURL).
+		Logger()
 
-func (c *cli) loadCredential() (credential, error) {
+	c.cloud.client = &cloud.Client{
+		BaseURL:    cloudURL,
+		IDPKey:     idpkey(),
+		HTTPClient: &c.httpClient,
+		Logger:     &clientLogger,
+	}
+	c.cloud.output = c.output
+
+	// checks if this client version can communicate with Terramate Cloud.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCloudTimeout)
+	defer cancel()
+	err := c.cloud.client.CheckVersion(ctx)
+	if err != nil {
+		return errors.E(err, clitest.ErrCloudCompat)
+	}
+
 	probes := c.credentialPrecedence(c.output)
-	var cred credential
 	var found bool
 	for _, probe := range probes {
 		var err error
 		found, err = probe.Load()
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if found {
-			cred = probe
 			break
 		}
 	}
 	if !found {
-		return nil, errors.E("no credential found")
+		return errors.E("no credential found")
+	}
+	return nil
+}
+
+func (c *cli) ensureAllStackHaveIDs(stacks config.List[*config.SortableStack]) {
+	logger := log.With().
+		Str("action", "cli.ensureAllStackHaveIDs").
+		Logger()
+
+	var stacksMissingIDs []string
+	for _, st := range stacks {
+		if st.ID == "" {
+			stacksMissingIDs = append(stacksMissingIDs, st.Dir().String())
+		}
 	}
 
-	return cred, nil
+	if len(stacksMissingIDs) > 0 {
+		for _, stackPath := range stacksMissingIDs {
+			logger.Error().Str("stack", stackPath).Msg("stack is missing the ID field")
+		}
+		logger.Warn().Msg("Stacks are missing IDs. You can use 'terramate create --ensure-stack-ids' to add missing IDs to all stacks.")
+		c.handleCriticalError(errors.E(clitest.ErrCloudStacksWithoutID))
+	}
 }
 
 func tokenClaims(token string) (jwt.MapClaims, error) {
@@ -401,10 +1027,13 @@ func tokenClaims(token string) (jwt.MapClaims, error) {
 func cloudBaseURL() string {
 	var baseURL string
 	cloudHost := os.Getenv("TMC_API_HOST")
+	cloudURL := os.Getenv("TMC_API_URL")
 	if cloudHost != "" {
 		baseURL = "https://" + cloudHost
+	} else if cloudURL != "" {
+		baseURL = cloudURL
 	} else {
-		baseURL = cloudDefaultBaseURL
+		baseURL = cloud.BaseURL
 	}
 	return baseURL
 }
@@ -415,4 +1044,8 @@ func idpkey() string {
 		idpKey = defaultAPIKey
 	}
 	return idpKey
+}
+
+func cloudError() error {
+	return errors.E(clitest.ErrCloud)
 }
